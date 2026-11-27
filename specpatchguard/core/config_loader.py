@@ -89,8 +89,11 @@ _TOOLS_KEYS = {
     "max_tool_output_chars",
     "command_timeout_sec",
 }
-_OUTPUT_KEYS = {"result_dir", "spec_cache_dir", "resume"}
-_PIPELINE_KEYS = {
+_OUTPUT_REQUIRED_KEYS = {"result_dir", "spec_cache_dir", "resume"}
+_OUTPUT_OPTIONAL_KEYS = {"force_refresh"}
+_OUTPUT_ALLOWED_KEYS = _OUTPUT_REQUIRED_KEYS | _OUTPUT_OPTIONAL_KEYS
+_OUTPUT_KEYS = _OUTPUT_REQUIRED_KEYS
+_PIPELINE_REQUIRED_KEYS = {
     "target_tier",
     "enable_cross_rep_tier_a",
     "enable_cross_rep_tier_b",
@@ -99,7 +102,18 @@ _PIPELINE_KEYS = {
     "syntax_fix_max_rounds",
     "hypothesis_max_examples",
 }
-_PIPELINE_TIERS = {"tier_a", "tier_b", "auto"}
+_PIPELINE_OPTIONAL_KEYS = {
+    "max_tier_b_predicates",
+    "tier_b_predicate_proposers",
+    "enable_tier_c_nonexec_python",
+    "calibration_min_passing_agreement",
+    "calibration_min_passing_samples",
+    "enable_patch_targeted_disagreement",
+    "max_disagreement_probes",
+}
+_PIPELINE_ALLOWED_KEYS = _PIPELINE_REQUIRED_KEYS | _PIPELINE_OPTIONAL_KEYS
+_PIPELINE_KEYS = _PIPELINE_REQUIRED_KEYS
+_PIPELINE_TIERS = {"tier_a", "tier_b", "tier_c", "auto"}
 _ENV_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -360,6 +374,10 @@ class Settings:
         return self.output["resume"]
 
     @property
+    def force_refresh(self) -> bool:
+        return bool(self.output.get("force_refresh", False))
+
+    @property
     def llm_config_path(self) -> Path | None:
         return self.api.get("llm_config_path")
 
@@ -435,14 +453,17 @@ def load_settings(path: str | Path, env_path: str | Path | None = None) -> Setti
     image_name = raw_docker["image_name"]
     if not isinstance(image_name, str) or not image_name.strip() or any(ch.isspace() for ch in image_name.strip()):
         raise ConfigError("docker.image_name must be a non-empty image tag without whitespace")
+    host_mount_path = resolve_local_path(
+        base_dir, raw_docker["host_mount_root"], field_name="docker.host_mount_root"
+    )
+    if host_mount_path is None:
+        raise ConfigError("docker.host_mount_root cannot be blank")
     docker = {
         "image_name": image_name.strip(),
         "container_work_root": validate_server_path(
             "docker.container_work_root", raw_docker["container_work_root"], require_posix_abs=True
         ),
-        "host_mount_root": validate_server_path(
-            "docker.host_mount_root", raw_docker["host_mount_root"], allow_blank=False
-        ),
+        "host_mount_root": host_mount_path.as_posix(),
         "timeout_seconds": _require_int("docker.timeout_seconds", raw_docker["timeout_seconds"], 1),
         "nano_cpus": _require_int("docker.nano_cpus", raw_docker["nano_cpus"], 1),
     }
@@ -516,24 +537,54 @@ def load_settings(path: str | Path, env_path: str | Path | None = None) -> Setti
     }
 
     raw_output = raw["output"]
-    if set(raw_output) != _OUTPUT_KEYS:
-        raise ConfigError(f"output section must contain exact keys {sorted(_OUTPUT_KEYS)}")
+    if not (_OUTPUT_REQUIRED_KEYS <= set(raw_output) <= _OUTPUT_ALLOWED_KEYS):
+        raise ConfigError(
+            f"output section must contain {sorted(_OUTPUT_REQUIRED_KEYS)} "
+            f"(optional: {sorted(_OUTPUT_OPTIONAL_KEYS)})"
+        )
     result_dir = resolve_local_path(base_dir, raw_output["result_dir"], field_name="output.result_dir")
     spec_cache_dir = resolve_local_path(base_dir, raw_output["spec_cache_dir"], field_name="output.spec_cache_dir")
     if result_dir is None or spec_cache_dir is None:
         raise ConfigError("output.result_dir and output.spec_cache_dir cannot be blank")
+    force_refresh = (
+        _require_bool("output.force_refresh", raw_output["force_refresh"])
+        if "force_refresh" in raw_output
+        else False
+    )
     output = {
         "result_dir": result_dir,
         "spec_cache_dir": spec_cache_dir,
         "resume": _require_bool("output.resume", raw_output["resume"]),
+        "force_refresh": force_refresh,
     }
 
     raw_pipeline = raw["pipeline"]
-    if set(raw_pipeline) != _PIPELINE_KEYS:
-        raise ConfigError(f"pipeline section must contain exact keys {sorted(_PIPELINE_KEYS)}")
+    if not (_PIPELINE_REQUIRED_KEYS <= set(raw_pipeline) <= _PIPELINE_ALLOWED_KEYS):
+        raise ConfigError(
+            f"pipeline section must contain {sorted(_PIPELINE_REQUIRED_KEYS)} "
+            f"(optional: {sorted(_PIPELINE_OPTIONAL_KEYS)})"
+        )
     target_tier = raw_pipeline["target_tier"]
     if not isinstance(target_tier, str) or target_tier not in _PIPELINE_TIERS:
         raise ConfigError(f"pipeline.target_tier must be one of {sorted(_PIPELINE_TIERS)}")
+    max_tier_b_predicates = (
+        _require_int("pipeline.max_tier_b_predicates", raw_pipeline["max_tier_b_predicates"], 1)
+        if "max_tier_b_predicates" in raw_pipeline
+        else 6
+    )
+    if max_tier_b_predicates > 6:
+        raise ConfigError("pipeline.max_tier_b_predicates must be <= 6")
+    calibration_min_agreement = (
+        _require_finite_number(
+            "pipeline.calibration_min_passing_agreement",
+            raw_pipeline["calibration_min_passing_agreement"],
+        )
+        if "calibration_min_passing_agreement" in raw_pipeline
+        else 0.8
+    )
+    if not 0.0 <= calibration_min_agreement <= 1.0:
+        raise ConfigError("pipeline.calibration_min_passing_agreement must be in [0, 1]")
+
     pipeline = {
         "target_tier": target_tier,
         "enable_cross_rep_tier_a": _require_bool(
@@ -553,6 +604,40 @@ def load_settings(path: str | Path, env_path: str | Path | None = None) -> Setti
         ),
         "hypothesis_max_examples": _require_int(
             "pipeline.hypothesis_max_examples", raw_pipeline["hypothesis_max_examples"], 1
+        ),
+        "max_tier_b_predicates": max_tier_b_predicates,
+        "tier_b_predicate_proposers": (
+            _require_int("pipeline.tier_b_predicate_proposers", raw_pipeline["tier_b_predicate_proposers"], 1)
+            if "tier_b_predicate_proposers" in raw_pipeline
+            else 2
+        ),
+        "enable_tier_c_nonexec_python": (
+            _require_bool("pipeline.enable_tier_c_nonexec_python", raw_pipeline["enable_tier_c_nonexec_python"])
+            if "enable_tier_c_nonexec_python" in raw_pipeline
+            else False
+        ),
+        "calibration_min_passing_agreement": calibration_min_agreement,
+        "calibration_min_passing_samples": (
+            _require_int(
+                "pipeline.calibration_min_passing_samples",
+                raw_pipeline["calibration_min_passing_samples"],
+                1,
+            )
+            if "calibration_min_passing_samples" in raw_pipeline
+            else 2
+        ),
+        "enable_patch_targeted_disagreement": (
+            _require_bool(
+                "pipeline.enable_patch_targeted_disagreement",
+                raw_pipeline["enable_patch_targeted_disagreement"],
+            )
+            if "enable_patch_targeted_disagreement" in raw_pipeline
+            else True
+        ),
+        "max_disagreement_probes": (
+            _require_int("pipeline.max_disagreement_probes", raw_pipeline["max_disagreement_probes"], 1)
+            if "max_disagreement_probes" in raw_pipeline
+            else 5
         ),
     }
 

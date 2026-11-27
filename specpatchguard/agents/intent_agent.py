@@ -3,10 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
-from ..analysis.protocols import ToolExecutionError
+from ..analysis.protocols import ToolExecutionError, resolve_repo_rel_path
 from ..analysis.tool_registry import ToolDispatcher
+from ..core.cache_utils import (
+    compute_anchor_methods_hash,
+    load_valid_cache,
+    resolve_cache_path,
+    sanitize_cache_segment,
+    save_cache_atomic,
+)
 from ..core.config_loader import Settings
 from ..data.schemas import (
     BoundaryContext,
@@ -111,6 +119,78 @@ def _coerce_str_list(value: Any) -> list[str]:
     return [str(x).strip() for x in value if str(x).strip()]
 
 
+def _coerce_param_field_semantics(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    allowed_kinds = {"param", "field", "local_var", "return"}
+    items: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        raw_kind = str(raw.get("kind") or "local_var").strip().lower()
+        kind = raw_kind if raw_kind in allowed_kinds else "local_var"
+        items.append(
+            {
+                "name": name,
+                "kind": kind,
+                "java_type": str(raw.get("java_type") or "").strip(),
+                "semantic_role": str(raw.get("semantic_role") or "").strip(),
+                "valid_domain_or_invariants": str(raw.get("valid_domain_or_invariants") or "").strip(),
+                "nullable_or_edge_cases": str(raw.get("nullable_or_edge_cases") or "").strip(),
+            }
+        )
+    return items
+
+
+def _normalize_optional_rel_path(raw_loc: Any) -> str:
+    text = str(raw_loc or "").strip()
+    if not text:
+        return ""
+    try:
+        return resolve_repo_rel_path(text, readonly_prepatch=False)
+    except ToolExecutionError:
+        return text.replace("\\", "/")
+
+
+def _coerce_callee_contracts(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        sig = str(raw.get("callee_signature") or "").strip()
+        if not sig:
+            continue
+        items.append(
+            {
+                "callee_signature": sig,
+                "resolved_location": _normalize_optional_rel_path(raw.get("resolved_location")),
+                "precondition": str(raw.get("precondition") or "").strip(),
+                "return_semantics": str(raw.get("return_semantics") or "").strip(),
+                "side_effects": str(raw.get("side_effects") or "").strip(),
+                "exception_behavior": str(raw.get("exception_behavior") or "").strip(),
+            }
+        )
+    return items
+
+
+def _coerce_structured_defect_intent(value: Any, *, bug_report_available: bool) -> dict[str, Any]:
+    if not isinstance(value, dict) or not value:
+        return {}
+    return {
+        "method_responsibility": str(value.get("method_responsibility") or "").strip(),
+        "bug_report_claims": _coerce_str_list(value.get("bug_report_claims")),
+        "failing_test_assertions": _coerce_str_list(value.get("failing_test_assertions")),
+        "trigger_conditions": _coerce_str_list(value.get("trigger_conditions")),
+        "expected_postcondition_summary": str(value.get("expected_postcondition_summary") or "").strip(),
+        "bug_report_available": bool(value.get("bug_report_available", bug_report_available)),
+    }
+
+
 class IntentContextAgent:
     """Agent 1: explores pre-patch repository context and produces an enriched `IntentContextPack`."""
 
@@ -144,6 +224,12 @@ class IntentContextAgent:
             except LLMParseError:
                 return {}, True
 
+    @staticmethod
+    def _intent_cache_path(base_pack: IntentContextPack, cache_dir: Path) -> Path:
+        safe_bug = sanitize_cache_segment(base_pack.bug_id)
+        anchor_hash = compute_anchor_methods_hash(base_pack.anchors, base_pack.target_methods)
+        return resolve_cache_path(cache_dir, "intent", f"{safe_bug}__{anchor_hash}__intent_pack.json")
+
     def explore(
         self,
         task: PatchBlindTask,
@@ -152,11 +238,48 @@ class IntentContextAgent:
         initial_pack: IntentContextPack | None = None,
         include_lsp: bool = True,
         max_rounds: int | None = None,
+        persist_cache: bool = False,
+        cache_dir: Path | None = None,
+        force_refresh: bool | None = None,
     ) -> IntentContextPack:
         """Analyze a `PatchBlindTask` via optional Docker/LSP tools and return an enriched `IntentContextPack`."""
         _assert_dispatcher_patch_blind(dispatcher)
 
         base_pack = initial_pack or build_initial_intent_pack(task, classifier=self.tier_classifier)
+        use_cache = persist_cache or cache_dir is not None
+        target_cache_dir = Path(cache_dir) if cache_dir is not None else self.settings.spec_cache_dir
+        eff_force_refresh = self.settings.force_refresh if force_refresh is None else bool(force_refresh)
+        cache_path = self._intent_cache_path(base_pack, target_cache_dir) if use_cache else None
+
+        if cache_path is not None:
+            cached = load_valid_cache(
+                cache_path,
+                force_refresh=eff_force_refresh,
+                validator=lambda d: (
+                    d.get("bug_id") == base_pack.bug_id
+                    and not bool((d.get("extra_context") or {}).get("intent_parse_degraded", False))
+                    and (
+                        dispatcher is None
+                        or (d.get("extra_context") or {}).get("has_tools", True) is not False
+                    )
+                ),
+            )
+            if cached is not None:
+                try:
+                    loaded = IntentContextPack.from_dict(cached)
+                    rebound_extra = dict(loaded.extra_context)
+                    target_tier_cfg = str(self.settings.pipeline.get("target_tier", "auto"))
+                    if target_tier_cfg in {"tier_a", "tier_b", "tier_c"} and loaded.tier != target_tier_cfg:
+                        rebound_extra["configured_target_tier"] = target_tier_cfg
+                    return replace(
+                        loaded,
+                        patch_id=task.patch_id,
+                        anchors=list(task.anchors),
+                        extra_context=rebound_extra,
+                    )
+                except (KeyError, TypeError, ValueError):
+                    pass
+
         user_prompt = build_intent_user_prompt(task, base_pack, has_tools=(dispatcher is not None))
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": INTENT_SYSTEM_PROMPT},
@@ -195,6 +318,12 @@ class IntentContextAgent:
         root_cause = str(parsed.get("root_cause_hypothesis") or "").strip()
         entry_hint = str(parsed.get("entry_harness_hint") or base_pack.entry_harness_skeleton).strip()
         rec_tier_raw = str(parsed.get("recommended_tier") or "").strip().lower()
+        param_field_sem = _coerce_param_field_semantics(parsed.get("parameter_field_semantics"))
+        callee_contracts = _coerce_callee_contracts(parsed.get("callee_contracts"))
+        structured_intent = _coerce_structured_defect_intent(
+            parsed.get("structured_defect_intent"),
+            bug_report_available=bool(task.bug_report.available),
+        )
 
         enriched_boundary = _harvest_boundary_context(
             base_pack.boundary_context,
@@ -207,11 +336,15 @@ class IntentContextAgent:
             bug_intent_summary=summary,
             entry_harness_skeleton=entry_hint,
             boundary_context=enriched_boundary,
+            parameter_field_semantics=param_field_sem,
+            callee_contracts=callee_contracts,
+            structured_defect_intent=structured_intent,
             extra_context={
                 **base_pack.extra_context,
                 "root_cause_hypothesis": root_cause,
                 "anchor_analysis": anchor_analysis,
                 "intent_parse_degraded": parse_degraded,
+                "has_tools": dispatcher is not None,
                 "budget_exhausted": budget_exhausted,
                 "rounds_used": rounds_used,
                 "tool_trace": [
@@ -234,13 +367,16 @@ class IntentContextAgent:
             )
 
         effective_tier: TierType = decision.tier
-        if target_tier_cfg in {"tier_a", "tier_b"} and decision.tier != target_tier_cfg:
+        if target_tier_cfg in {"tier_a", "tier_b", "tier_c"} and decision.tier != target_tier_cfg:
             candidate_pack.extra_context["configured_target_tier"] = target_tier_cfg
-        if rec_tier_raw in {"tier_a", "tier_b"}:
+        if rec_tier_raw in {"tier_a", "tier_b", "tier_c"}:
             candidate_pack.extra_context["llm_recommended_tier"] = rec_tier_raw
 
-        return replace(
+        enriched_pack = replace(
             candidate_pack,
             tier=effective_tier,
             tier_decision=decision,
         )
+        if cache_path is not None and not parse_degraded:
+            save_cache_atomic(cache_path, enriched_pack.to_dict())
+        return enriched_pack

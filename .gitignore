@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .pytest_cache/
 SpecPatchGuard_result/
+d4j_work/

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+import hashlib
 import json
 from pathlib import PurePosixPath
 import queue
@@ -14,6 +15,7 @@ import time
 from typing import Any, BinaryIO, Literal, Protocol, runtime_checkable
 from urllib.parse import unquote, urlparse
 
+from ..core.cache_utils import sanitize_cache_segment
 from .protocols import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
     RepoExecutor,
@@ -106,12 +108,24 @@ class DockerJdtlsTransport:
         jdtls_java = f"{lsp_cfg['jdtls_java_home'].rstrip('/')}/bin/java"
         jdtls_home = lsp_cfg["jdtls_home"].rstrip("/")
         jdtls_cfg_dir = lsp_cfg["jdtls_config_dir"].rstrip("/")
-        jdtls_ws = lsp_cfg["jdtls_workspace_cache"].rstrip("/")
+        jdtls_ws_base = lsp_cfg["jdtls_workspace_cache"].rstrip("/") or "/tmp/jdtls_ws_cache"
+        safe_key = sanitize_cache_segment(PurePosixPath(work_root).name or "default")
+        work_hash = hashlib.sha256(work_root.encode("utf-8")).hexdigest()[:8]
+        unique_key = f"{safe_key}_{work_hash}"
+        jdtls_ws = (
+            jdtls_ws_base
+            if PurePosixPath(jdtls_ws_base).name == unique_key
+            else f"{jdtls_ws_base}/{unique_key}"
+        )
+        self.workspace_data_dir = jdtls_ws
+        pid_file = f"{jdtls_ws}/.jdtls.pid"
 
         launcher_glob = shlex.quote(f"{jdtls_home}/plugins/org.eclipse.equinox.launcher_") + "*.jar"
         launcher_cmd = (
             f"LAUNCHER=$(ls {launcher_glob} 2>/dev/null | head -n 1); "
             '[ -n "$LAUNCHER" ] || { echo "jdtls launcher jar not found" >&2; exit 127; }; '
+            f"mkdir -p {shlex.quote(jdtls_ws)} && "
+            f"echo $$ > {shlex.quote(pid_file)} && "
             f"exec {shlex.quote(jdtls_java)} "
             "-Declipse.application=org.eclipse.jdt.ls.core.id1 "
             "-Dosgi.bundles.defaultStartLevel=4 "
@@ -187,12 +201,41 @@ class DockerJdtlsTransport:
                     stream.close()
                 except OSError:
                     pass
-        if self._proc.poll() is None:
+        still_alive = self._proc.poll() is None
+        if still_alive:
             self._proc.terminate()
             try:
                 self._proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
+        if self.container_name and getattr(self, "workspace_data_dir", ""):
+            ws_dir = self.workspace_data_dir
+            pid_file = f"{ws_dir}/.jdtls.pid"
+            data_pattern = re.escape(ws_dir)
+            cleanup_script = (
+                f"if [ -f {shlex.quote(pid_file)} ]; then "
+                f"PID=$(cat {shlex.quote(pid_file)} 2>/dev/null || true); "
+                f'[ -n "$PID" ] && kill "$PID" 2>/dev/null || true; '
+                f"rm -f -- {shlex.quote(pid_file)}; "
+                "fi; "
+                f'pkill -f -- "[-][d]ata {data_pattern}( |$)" 2>/dev/null || true'
+            )
+            try:
+                subprocess.run(
+                    [
+                        "docker",
+                        "exec",
+                        self.container_name,
+                        "sh",
+                        "-c",
+                        cleanup_script,
+                    ],
+                    timeout=5,
+                    capture_output=True,
+                    check=False,
+                )
+            except Exception:
+                pass
 
 
 def _path_to_uri(work_root: str, rel_path: str) -> str:
@@ -267,6 +310,15 @@ class LspNavigationTools:
         self._initialized = False
         self._opened_uris: set[str] = set()
 
+    def _handle_server_request(self, msg: dict[str, Any]) -> None:
+        method = msg.get("method")
+        if method == "workspace/configuration":
+            items = (msg.get("params") or {}).get("items") or []
+            result: Any = [{} for _ in items] if isinstance(items, list) else []
+        else:
+            result = None
+        self.transport.send({"jsonrpc": "2.0", "id": msg["id"], "result": result})
+
     def _request(self, method: str, params: dict[str, Any] | None, timeout: float) -> Any:
         req_id = self._next_id
         self._next_id += 1
@@ -277,9 +329,9 @@ class LspNavigationTools:
             if remaining <= 0:
                 raise LspProtocolError(f"LSP request '{method}' timed out after {timeout}s")
             msg = self.transport.receive(timeout=remaining)
-            # Answer server-to-client requests (e.g., client/registerCapability, workspace/configuration)
-            if "method" in msg and "id" in msg and msg["id"] != req_id:
-                self.transport.send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+            # Answer server-to-client requests (e.g., workspace/configuration, client/registerCapability)
+            if "method" in msg and "id" in msg:
+                self._handle_server_request(msg)
                 continue
             if msg.get("id") != req_id:
                 continue
@@ -309,6 +361,32 @@ class LspNavigationTools:
         self._request("initialize", params, timeout=float(self.lsp_cfg["init_timeout_sec"]))
         self._notify("initialized", {})
         self._initialized = True
+        self._wait_for_service_ready()
+
+    def _wait_for_service_ready(self) -> None:
+        """Wait briefly for jdtls `language/status` `ServiceReady` without failing if timeout elapses."""
+        default_wait = 15.0 if isinstance(self.transport, DockerJdtlsTransport) else 0.0
+        ready_wait_sec = float(self.lsp_cfg.get("ready_wait_sec", default_wait))
+        if ready_wait_sec <= 0.0:
+            return
+        deadline = time.monotonic() + ready_wait_sec
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                msg = self.transport.receive(timeout=min(remaining, 1.0))
+            except LspProtocolError as exc:
+                if "timed out" not in str(exc).lower() or time.monotonic() >= deadline:
+                    return
+                continue
+            if "method" in msg and "id" in msg:
+                self._handle_server_request(msg)
+                continue
+            if msg.get("method") == "language/status":
+                status_type = str((msg.get("params") or {}).get("type", ""))
+                if status_type in {"ServiceReady", "Started"}:
+                    return
 
     def ensure_opened(self, file_path: str) -> tuple[str, str]:
         self.ensure_initialized()

@@ -14,6 +14,13 @@ import tempfile
 from typing import Any, Callable
 
 from ..agents.llm_client import LLMClient, extract_code_blocks
+from ..core.cache_utils import (
+    compute_anchor_methods_hash,
+    load_valid_cache,
+    resolve_cache_path,
+    sanitize_cache_segment,
+    save_cache_atomic,
+)
 from ..data.schemas import CrossRepResult, IntentContextPack, TierType
 from ..prompts.pbt_prompts import (
     CROSS_REP_END_MARKER,
@@ -242,16 +249,24 @@ class TierAPythonHypothesisStrategy:
         script_runner: Callable[[Path, int], tuple[int, str, str]] | None = None,
         timeout_sec: int = 60,
         hypothesis_available: bool | None = None,
+        cache_dir: Path | None = None,
     ) -> None:
         # Optional server hypothesis dependency — documented in SERVER_DEPLOY_CHECKLIST.md (SERVER_CONFIG_REQUIRED).
         self.llm_client = llm_client
         self._script_runner = script_runner or _default_python_runner
         self.timeout_sec = timeout_sec
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         self._hypothesis_available = (
             bool(importlib.util.find_spec("hypothesis"))
             if hypothesis_available is None
             else bool(hypothesis_available)
         )
+
+    def _cache_path(self, intent_pack: IntentContextPack, eff_cache_dir: Path) -> Path:
+        safe_bug = sanitize_cache_segment(intent_pack.bug_id)
+        anchor_hash = compute_anchor_methods_hash(intent_pack.anchors, intent_pack.target_methods)
+        safe_tier = sanitize_cache_segment(self.tier)
+        return resolve_cache_path(eff_cache_dir, "cross_rep", f"{safe_bug}__{anchor_hash}__{safe_tier}__cross_rep.json")
 
     def generate_candidates(
         self, intent_pack: IntentContextPack, config: dict[str, Any]
@@ -265,6 +280,28 @@ class TierAPythonHypothesisStrategy:
         max_examples = int(config.get("hypothesis_max_examples", 100))
         max_rounds = max(1, int(config.get("syntax_fix_max_rounds", 3)))
         use_hypothesis = self._hypothesis_available
+
+        raw_cache_dir = config.get("cache_dir")
+        eff_cache_dir = Path(raw_cache_dir) if raw_cache_dir is not None else self.cache_dir
+        eff_force_refresh = bool(config.get("force_refresh", False))
+        cache_path = self._cache_path(intent_pack, eff_cache_dir) if eff_cache_dir is not None else None
+        if cache_path is not None:
+            cached = load_valid_cache(
+                cache_path,
+                force_refresh=eff_force_refresh,
+                validator=lambda d: (
+                    (d.get("diagnostics") or {}).get("status") == "ok"
+                    and d.get("tier") == self.tier
+                    and (d.get("diagnostics") or {}).get("bug_id") in (None, intent_pack.bug_id)
+                    and bool((d.get("diagnostics") or {}).get("hypothesis_available", False)) == bool(use_hypothesis)
+                    and int((d.get("diagnostics") or {}).get("hypothesis_max_examples", max_examples)) >= max_examples
+                ),
+            )
+            if cached is not None:
+                try:
+                    return CrossRepResult.from_dict(cached)
+                except (KeyError, TypeError, ValueError):
+                    pass
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": CROSS_REP_TIER_A_SYSTEM_PROMPT},
@@ -371,16 +408,21 @@ class TierAPythonHypothesisStrategy:
             attempts.append(
                 {"attempt": attempt_idx, "ok": True, "candidate_count": len(candidates)}
             )
-            return CrossRepResult(
+            result = CrossRepResult(
                 tier="tier_a",
                 candidate_inputs=candidates,
                 python_model_code=candidate_code,
                 diagnostics={
                     "status": "ok",
+                    "bug_id": intent_pack.bug_id,
                     "hypothesis_available": self._hypothesis_available,
+                    "hypothesis_max_examples": max_examples,
                     "attempts": attempts,
                 },
             )
+            if cache_path is not None:
+                save_cache_atomic(cache_path, result.to_dict())
+            return result
 
         return CrossRepResult(
             tier="tier_a",

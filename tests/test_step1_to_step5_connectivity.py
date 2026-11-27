@@ -774,7 +774,7 @@ if __name__ == "__main__":
     )
 
     # Atomic persistence & JSON round-trip verification
-    saved_files = list(settings.spec_cache_dir.glob("*step5_spec.json"))
+    saved_files = list(settings.spec_cache_dir.rglob("*step5_spec.json"))
     assert len(saved_files) == 1
     reloaded = SpecRefinementResult.from_dict(
         json.loads(saved_files[0].read_text(encoding="utf-8"))

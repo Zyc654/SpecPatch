@@ -162,7 +162,9 @@ def test_grep_code_docker_rg_and_gnu_grep_fallback():
         ev3 = json.dumps({"type": "context", "data": {"path": {"text": "src/A.java"}, "line_number": 11, "lines": {"text": "}\n"}}})
         return 0, f"{ev1}\n{ev2}\n{ev3}\n", ""
 
-    docker_exec = DockerExecExecutor("c1", "/workspace/d4j_work/Lang_1", runner=mock_rg_runner)
+    docker_exec = DockerExecExecutor(
+        "c1", "/workspace/d4j_work/Lang_1", runner=mock_rg_runner, use_inner_timeout=False
+    )
     search = RepoSearchTools(docker_exec, tools_cfg, readonly_prepatch=True)
     res = search.grep_code("return x", context_before=2, context_after=3)
     assert res["total_matches"] == 1
@@ -177,7 +179,9 @@ def test_grep_code_docker_rg_and_gnu_grep_fallback():
             return 127, "", "rg: not found"
         return 0, "src/A.java-9-int x = 0;\nsrc/A.java:10:return x;\nsrc/A.java-11-}\n", ""
 
-    docker_exec2 = DockerExecExecutor("c1", "/workspace/d4j_work/Lang_1", runner=mock_grep_fallback)
+    docker_exec2 = DockerExecExecutor(
+        "c1", "/workspace/d4j_work/Lang_1", runner=mock_grep_fallback, use_inner_timeout=False
+    )
     res2 = RepoSearchTools(docker_exec2, tools_cfg, readonly_prepatch=True).grep_code("return x", context_lines=1)
     assert res2["total_matches"] == 1
     assert res2["matches"][0]["context_before_lines"] == [{"line": 9, "text": "int x = 0;"}]
@@ -188,7 +192,9 @@ def test_grep_code_docker_rg_and_gnu_grep_fallback():
             return 2, "", "regex parse error"
         raise AssertionError("Should not fall back to grep when rg exits with rc=2")
 
-    docker_exec3 = DockerExecExecutor("c1", "/workspace/d4j_work/Lang_1", runner=mock_rg_syntax_error)
+    docker_exec3 = DockerExecExecutor(
+        "c1", "/workspace/d4j_work/Lang_1", runner=mock_rg_syntax_error, use_inner_timeout=False
+    )
     with pytest.raises(ToolExecutionError, match="Container rg failed"):
         RepoSearchTools(docker_exec3, tools_cfg, readonly_prepatch=True).grep_code("[unclosed")
     with pytest.raises(ToolExecutionError, match="cannot start with '-'"):
@@ -822,3 +828,188 @@ public class Outer {
     assert trunc_overloads["truncated"] is True
     assert trunc_overloads["overload_count"] == len(trunc_overloads["overloads"]) < 15
     assert len(json.dumps(trunc_overloads, ensure_ascii=False)) <= 1200
+
+
+def test_docker_exec_executor_inner_timeout_and_detection() -> None:
+    """Verify DockerExecExecutor wraps commands with inner `timeout -k 10` and detects rc 124/137."""
+    recorded: list[tuple[list[str], int]] = []
+
+    def fake_runner(argv: list[str], timeout: int) -> tuple[int, str, str]:
+        recorded.append((argv, timeout))
+        if len(recorded) == 1:
+            return 0, "ok\n", ""
+        if len(recorded) == 2:
+            return 124, "", "timed out"
+        if len(recorded) == 3:
+            return 137, "", ""
+        return 0, "raw\n", ""
+
+    executor = DockerExecExecutor(
+        container_name="d4j_box",
+        work_root="/workspace/d4j_work",
+        runner=fake_runner,
+        command_timeout_sec=30,
+    )
+    res_ok = executor.exec_command(["echo", "hello"], timeout=25)
+    assert res_ok.returncode == 0
+    assert res_ok.timed_out is False
+    argv0, host_t0 = recorded[0]
+    assert host_t0 == 40
+    assert argv0[:7] == ["docker", "exec", "-w", "/workspace/d4j_work", "d4j_box", "sh", "-c"]
+    assert "timeout -k 10 25" in argv0[7]
+
+    res_124 = executor.exec_command(["sleep", "99"], timeout=20)
+    assert res_124.returncode == 124
+    assert res_124.timed_out is True
+
+    res_137 = executor.exec_command(["sleep", "99"], timeout=20)
+    assert res_137.returncode == 137
+    assert res_137.timed_out is True
+
+    # Opt-out preserves direct argv without inner shell wrapper
+    res_raw = executor.exec_command(["echo", "raw"], timeout=15, use_inner_timeout=False)
+    assert res_raw.returncode == 0
+    assert recorded[-1] == (["docker", "exec", "-w", "/workspace/d4j_work", "d4j_box", "echo", "raw"], 15)
+
+
+def test_jdtls_transport_isolation_cleanup_and_lsp_readiness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Verify per-project hashed -data isolation, pid+regex cleanup even after exit, colliding IDs, and ServiceReady wait."""
+    import hashlib
+    import io
+    import subprocess
+    from specpatchguard.analysis.lsp_client import DockerJdtlsTransport, LspNavigationTools, LspProtocolError
+
+    lsp_cfg = {
+        "backend": "jdtls_docker",
+        "command": "jdtls",
+        "jdtls_java_home": "/opt/jdk-17",
+        "jdtls_home": "/opt/jdtls",
+        "jdtls_config_dir": "/opt/jdtls/config_linux",
+        "jdtls_workspace_cache": "/tmp/jdtls_ws_cache",
+        "init_timeout_sec": 5,
+        "request_timeout_sec": 5,
+        "ready_wait_sec": 1.0,
+    }
+
+    popen_cmds: list[list[str]] = []
+    pkill_calls: list[list[str]] = []
+    procs: list[Any] = []
+
+    class _FakeProc:
+        def __init__(self, *, initially_dead: bool = False) -> None:
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO()
+            self.stderr = io.BytesIO()
+            self.terminated = initially_dead
+
+        def poll(self) -> int | None:
+            return None if not self.terminated else 0
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout: float = 3.0) -> int:
+            self.terminated = True
+            return 0
+
+        def kill(self) -> None:
+            self.terminated = True
+
+    dead_next = False
+
+    def fake_popen(argv: list[str], **kwargs: Any) -> _FakeProc:
+        popen_cmds.append(argv)
+        proc = _FakeProc(initially_dead=dead_next)
+        procs.append(proc)
+        return proc
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        pkill_calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    work_root_1 = "/workspace/d4j_work/Lang_51b"
+    hash_1 = hashlib.sha256(work_root_1.encode("utf-8")).hexdigest()[:8]
+    expected_ws_1 = f"/tmp/jdtls_ws_cache/Lang_51b_{hash_1}"
+
+    transport = DockerJdtlsTransport("d4j_box", lsp_cfg, work_root_1)
+    assert transport.workspace_data_dir == expected_ws_1
+    assert len(popen_cmds) == 1
+    inner_cmd = popen_cmds[0][-1]
+    assert f"mkdir -p {expected_ws_1}" in inner_cmd
+    assert f"{expected_ws_1}/.jdtls.pid" in inner_cmd
+    assert f"-data {expected_ws_1}" in inner_cmd
+
+    # Same directory basename under a different session subdir gets a distinct -data dir
+    dead_next = True
+    work_root_2 = "/workspace/d4j_work/s2/Lang_51b"
+    transport2 = DockerJdtlsTransport("d4j_box", lsp_cfg, work_root_2)
+    assert transport2.workspace_data_dir != transport.workspace_data_dir
+    assert "Lang_51b_" in transport2.workspace_data_dir
+
+    transport.close()
+    # Unconditional cleanup also runs when host `docker exec` already exited
+    transport2.close()
+    assert len(pkill_calls) == 2
+    assert pkill_calls[0][:4] == ["docker", "exec", "d4j_box", "sh"]
+    assert f"{expected_ws_1}/.jdtls.pid" in pkill_calls[0][-1]
+    assert f"[-][d]ata {expected_ws_1}( |$)" in pkill_calls[0][-1]
+    assert f"[-][d]ata {transport2.workspace_data_dir}( |$)" in pkill_calls[1][-1]
+
+    # Server-to-client request colliding on id=1 during _request + ServiceReady wait + EOF abort
+    class _ReadyTransport:
+        def __init__(self, inbox: list[Any]) -> None:
+            self.sent: list[dict[str, Any]] = []
+            self.inbox = list(inbox)
+            self.receive_calls = 0
+
+        def send(self, msg: dict[str, Any]) -> None:
+            self.sent.append(msg)
+
+        def receive(self, timeout: float = 900.0) -> dict[str, Any]:
+            self.receive_calls += 1
+            if not self.inbox:
+                raise LspProtocolError("LSP reader failed: EOF")
+            nxt = self.inbox.pop(0)
+            if isinstance(nxt, BaseException):
+                raise nxt
+            return nxt
+
+        def close(self) -> None:
+            pass
+
+    executor = LocalRepoExecutor(tmp_path)
+    tools_cfg = {"max_tool_output_chars": 8000, "lsp_context_lines": 2}
+    ready_transport = _ReadyTransport(
+        [
+            # Colliding id=1 server-to-client request during initialize (client req_id=1)
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "workspace/configuration",
+                "params": {"items": [{"section": "java"}, {"section": "xml"}]},
+            },
+            # Actual initialize response for client id=1
+            {"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {}}},
+            # Transient receive timeout followed by ServiceReady
+            LspProtocolError("LSP receive timed out after 1.0s"),
+            {
+                "jsonrpc": "2.0",
+                "method": "language/status",
+                "params": {"type": "ServiceReady", "message": "Ready"},
+            },
+        ]
+    )
+    lsp_tools = LspNavigationTools(ready_transport, executor, lsp_cfg, tools_cfg, readonly_prepatch=True)
+    lsp_tools.ensure_initialized()
+    assert {"jsonrpc": "2.0", "id": 1, "result": [{}, {}]} in ready_transport.sent
+
+    # Non-timeout LspProtocolError (EOF/crash) exits _wait_for_service_ready immediately without spinning
+    eof_transport = _ReadyTransport([])
+    lsp_eof = LspNavigationTools(eof_transport, executor, {**lsp_cfg, "ready_wait_sec": 5.0}, tools_cfg)
+    lsp_eof._wait_for_service_ready()
+    assert eof_transport.receive_calls == 1
+
+

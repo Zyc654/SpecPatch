@@ -189,3 +189,129 @@ def test_review_regressions_ast_alias_bypass_and_env_sanitization(monkeypatch: p
     assert "CUSTOM_SECRET_TOKEN" not in env
     assert env.get("PATH") == "/usr/bin"
 
+
+def test_tier_a_cross_rep_layer2_disk_cache_and_structured_semantics(tmp_path: Path) -> None:
+    """Verify Layer 2 cross-rep disk cache reuse, degraded rejection, force_refresh, and CJK-free structured semantics prompt."""
+    import re
+    from pathlib import Path
+    from specpatchguard.core.cache_utils import compute_anchor_methods_hash, resolve_cache_path, sanitize_cache_segment
+    from specpatchguard.prompts.pbt_prompts import (
+        CROSS_REP_TIER_A_SYSTEM_PROMPT,
+        build_cross_rep_tier_a_prompt,
+    )
+
+    pack = IntentContextPack(
+        bug_id="Math-30",
+        patch_id="patch1.diff",
+        project="Math",
+        tier="tier_a",
+        bug_intent_summary="Compute asymptotic p-value cleanly.",
+        anchors=[],
+        target_methods=[
+            MethodSignatureInfo(
+                file_path="src/main/java/org/apache/commons/math3/stat/inference/MannWhitneyUTest.java",
+                class_name="MannWhitneyUTest",
+                method_name="calculateAsymptoticPValue",
+                visibility="private",
+                is_static=False,
+                is_constructor=False,
+                return_type="double",
+                parameter_types=["double", "int", "int"],
+                parameter_names=["Umin", "n1", "n2"],
+                throws_types=[],
+                modifiers=["private"],
+                javadoc="Compute p-value.",
+                raw_signature="private double calculateAsymptoticPValue(final double Umin, final int n1, final int n2)",
+            )
+        ],
+        failing_tests=[],
+        bug_report=BugReport(bug_id="Math-30"),
+        parameter_field_semantics=[
+            {"name": "Umin", "kind": "param", "meaning": "minimum U statistic"},
+            {"name": "n1n2prod", "kind": "local_var", "meaning": "product of n1 and n2 without int overflow"},
+        ],
+        callee_contracts=[
+            {"callee_signature": "FastMath.sqrt(double)", "return_semantics": "returns principal square root"}
+        ],
+        structured_defect_intent={"preconditions": ["n1 > 0", "n2 > 0"], "postconditions": ["0 <= ret <= 1"]},
+    )
+
+    # Structured semantics injected into prompt and CJK-free
+    rendered_prompt = build_cross_rep_tier_a_prompt(pack, max_examples=12, use_hypothesis=False)
+    assert '"name": "n1n2prod"' in rendered_prompt
+    assert '"kind": "local_var"' in rendered_prompt
+    assert "FastMath.sqrt" in rendered_prompt
+    assert "n1 > 0" in rendered_prompt
+    assert re.search(r"[\u4e00-\u9fff]", CROSS_REP_TIER_A_SYSTEM_PROMPT) is None
+    assert re.search(r"[\u4e00-\u9fff]", rendered_prompt) is None
+
+    good_script = f"""```python
+import json
+
+def generate_boundary_inputs(max_examples):
+    return [{{"case_id": "overflow_n", "args": [10.0, 50000, 50000], "category": "boundary", "rationale": "large product"}}]
+
+if __name__ == "__main__":
+    print("{CROSS_REP_START_MARKER}")
+    print(json.dumps(generate_boundary_inputs(10), allow_nan=False))
+    print("{CROSS_REP_END_MARKER}")
+```"""
+
+    cache_dir = tmp_path / "cache"
+    llm1 = _ScriptedLLM([good_script])
+    s1 = TierAPythonHypothesisStrategy(llm1, hypothesis_available=False, cache_dir=cache_dir)
+    res1 = s1.generate_candidates(pack, {"hypothesis_max_examples": 12})
+    assert res1.diagnostics["status"] == "ok"
+    assert len(llm1.recorded_messages) == 1
+
+    anchor_hash = compute_anchor_methods_hash(pack.anchors, pack.target_methods)
+    cache_file = resolve_cache_path(
+        cache_dir,
+        "cross_rep",
+        f"{sanitize_cache_segment(pack.bug_id)}__{anchor_hash}__{sanitize_cache_segment(pack.tier)}__cross_rep.json",
+    )
+    assert cache_file.exists()
+
+    # Cross-patch cache hit (patch2 reuses patch1 cross-rep result with zero LLM calls)
+    pack_p2 = IntentContextPack.from_dict(pack.to_dict())
+    pack_p2.patch_id = "patch2.diff"
+    llm2 = _ScriptedLLM([])
+    s2 = TierAPythonHypothesisStrategy(llm2, hypothesis_available=False, cache_dir=cache_dir)
+    res2 = s2.generate_candidates(pack_p2, {"hypothesis_max_examples": 12})
+    assert res2.diagnostics["status"] == "ok"
+    assert res2.candidate_inputs == res1.candidate_inputs
+    assert llm2.recorded_messages == []
+
+    # force_refresh=True bypasses disk cache
+    llm3 = _ScriptedLLM([good_script])
+    s3 = TierAPythonHypothesisStrategy(llm3, hypothesis_available=False, cache_dir=cache_dir)
+    res3 = s3.generate_candidates(pack_p2, {"hypothesis_max_examples": 12, "force_refresh": True})
+    assert res3.diagnostics["status"] == "ok"
+    assert len(llm3.recorded_messages) == 1
+
+    # Higher hypothesis_max_examples or switched hypothesis_available invalidates cache reuse
+    llm_more = _ScriptedLLM([good_script])
+    s_more = TierAPythonHypothesisStrategy(llm_more, hypothesis_available=False, cache_dir=cache_dir)
+    _ = s_more.generate_candidates(pack_p2, {"hypothesis_max_examples": 25})
+    assert len(llm_more.recorded_messages) == 1
+
+    llm_hyp = _ScriptedLLM([good_script])
+    s_hyp = TierAPythonHypothesisStrategy(llm_hyp, hypothesis_available=True, cache_dir=cache_dir)
+    _ = s_hyp.generate_candidates(pack_p2, {"hypothesis_max_examples": 12})
+    assert len(llm_hyp.recorded_messages) == 1
+
+    # Degraded output (syntax/validation exhaustion) is NOT persisted or reused
+    degraded_cache_dir = tmp_path / "degraded_cache"
+    bad_script = "```python\nimport os\n```"
+    llm_bad = _ScriptedLLM([bad_script, bad_script])
+    s_bad = TierAPythonHypothesisStrategy(llm_bad, hypothesis_available=False, cache_dir=degraded_cache_dir)
+    res_bad = s_bad.generate_candidates(pack, {"hypothesis_max_examples": 12, "syntax_fix_max_rounds": 2})
+    assert res_bad.diagnostics["status"] == "degraded_failed"
+    bad_file = resolve_cache_path(
+        degraded_cache_dir,
+        "cross_rep",
+        f"{sanitize_cache_segment(pack.bug_id)}__{anchor_hash}__{sanitize_cache_segment(pack.tier)}__cross_rep.json",
+    )
+    assert not bad_file.exists()
+
+

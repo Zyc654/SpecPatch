@@ -4,11 +4,19 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+from pathlib import Path
 import re
 import shlex
 import time
 from typing import Any, Callable, Literal, TypeVar
+from xml.sax.saxutils import escape as _xml_escape
 
+from ..core.cache_utils import (
+    load_valid_cache,
+    resolve_cache_path,
+    sanitize_cache_segment,
+    save_cache_atomic,
+)
 from ..core.config_loader import Settings
 from ..data.pkl_loader import canonicalize_project_name, parse_d4j_bug_id
 from .docker_backend import DockerSandboxBackend, SandboxError
@@ -451,6 +459,8 @@ class Defects4JRunner:
         *,
         compile_timeout_sec: int = 900,
         test_timeout_sec: int = 900,
+        cache_dir: Path | None = None,
+        force_refresh: bool = False,
     ) -> None:
         if type(compile_timeout_sec) is not int or compile_timeout_sec < 1:
             raise SandboxError("compile_timeout_sec must be an integer >= 1")
@@ -459,15 +469,43 @@ class Defects4JRunner:
         self.backend = backend
         self.compile_timeout_sec = compile_timeout_sec
         self.test_timeout_sec = test_timeout_sec
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.force_refresh = bool(force_refresh)
 
     @classmethod
-    def from_settings(cls, backend: DockerSandboxBackend, settings: Settings) -> Defects4JRunner:
+    def from_settings(
+        cls,
+        backend: DockerSandboxBackend,
+        settings: Settings,
+        *,
+        cache_dir: Path | None = None,
+        force_refresh: bool | None = None,
+    ) -> Defects4JRunner:
         """Construct a `Defects4JRunner` from validated `Settings`."""
         return cls(
             backend=backend,
             compile_timeout_sec=settings.defects4j["compile_timeout_sec"],
             test_timeout_sec=settings.defects4j["test_timeout_sec"],
+            cache_dir=cache_dir if cache_dir is not None else settings.spec_cache_dir,
+            force_refresh=settings.force_refresh if force_refresh is None else bool(force_refresh),
         )
+
+    def _layout_cache_path(
+        self,
+        bug_id: str,
+        version: str,
+        session_subdir: str | None = None,
+    ) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        safe_bug = sanitize_cache_segment(bug_id)
+        safe_ver = sanitize_cache_segment(version)
+        if session_subdir:
+            safe_sub = sanitize_cache_segment(session_subdir)
+            filename = f"{safe_bug}__{safe_ver}__{safe_sub}__layout.json"
+        else:
+            filename = f"{safe_bug}__{safe_ver}__layout.json"
+        return resolve_cache_path(self.cache_dir, "d4j_meta", filename)
 
     @staticmethod
     def _resolve_bug_coords(project_or_bug_id: str, bug_num: int | None) -> tuple[str, int, str]:
@@ -498,6 +536,8 @@ class Defects4JRunner:
         version_suffix: Literal["b", "f"] = "b",
         force_fresh: bool = False,
         session_subdir: str | None = None,
+        force_refresh: bool | None = None,
+        ensure_eclipse_files: bool = False,
     ) -> D4jProjectLayout:
         """Checkout a Defects4J bug inside the container, reset cleanly, and export layout metadata."""
         if version_suffix not in {"b", "f"}:
@@ -506,6 +546,7 @@ class Defects4JRunner:
         subdir = _validate_session_subdir(session_subdir)
         base_root = self.backend.container_work_root.rstrip("/") or "/"
         parent_dir = f"{base_root}/{subdir}" if subdir else base_root
+        rel_workdir = f"{subdir}/{proj}_{num}{version_suffix}" if subdir else f"{proj}_{num}{version_suffix}"
         workdir = f"{parent_dir}/{proj}_{num}{version_suffix}"
         version = f"{num}{version_suffix}"
         base_ref = f"D4J_{proj}_{num}_{'BUGGY' if version_suffix == 'b' else 'FIXED'}_VERSION"
@@ -540,8 +581,34 @@ class Defects4JRunner:
             )
 
         self.backend.set_active_workdir(workdir, base_ref=base_ref, state="prepatch")
-        if "__SPG_CHECKOUT_REUSED__" in co_res.stdout:
+        reused_checkout = "__SPG_CHECKOUT_REUSED__" in co_res.stdout
+        if reused_checkout:
             self.backend.restore_prepatch(remove_injected=False)
+
+        eff_refresh = self.force_refresh if force_refresh is None else bool(force_refresh)
+        cache_path = self._layout_cache_path(bug_id, version, session_subdir=subdir)
+        if cache_path is not None and reused_checkout and not force_fresh and not eff_refresh:
+            cached = load_valid_cache(
+                cache_path,
+                force_refresh=False,
+                validator=lambda d: (
+                    d.get("bug_id") == bug_id
+                    and d.get("version") == version
+                    and d.get("work_dir_rel") == rel_workdir
+                    and isinstance(d.get("layout"), dict)
+                    and d["layout"].get("work_dir") == workdir
+                    and bool(d["layout"].get("dir_src_classes"))
+                    and bool(d["layout"].get("dir_src_tests"))
+                ),
+            )
+            if cached is not None:
+                try:
+                    cached_layout = D4jProjectLayout.from_dict(cached["layout"])
+                    if ensure_eclipse_files:
+                        self.ensure_eclipse_project_files(cached_layout)
+                    return cached_layout
+                except (KeyError, TypeError, ValueError):
+                    pass
 
         prop_names = (
             "dir.src.classes",
@@ -586,7 +653,7 @@ class Defects4JRunner:
                 f"Incomplete Defects4J layout for {bug_id}: missing dir.src.classes or dir.src.tests"
             )
 
-        return D4jProjectLayout(
+        layout = D4jProjectLayout(
             project=proj,
             bug_num=num,
             bug_id=bug_id,
@@ -601,6 +668,98 @@ class Defects4JRunner:
             classes_modified=_split_nonempty_lines(props["classes.modified"]),
             cp_test=props["cp.test"].strip(),
         )
+        if cache_path is not None:
+            save_cache_atomic(
+                cache_path,
+                {
+                    "bug_id": bug_id,
+                    "version": version,
+                    "work_dir_rel": rel_workdir,
+                    "layout": layout.to_dict(),
+                },
+            )
+        if ensure_eclipse_files:
+            self.ensure_eclipse_project_files(layout)
+        return layout
+
+    def ensure_eclipse_project_files(self, layout: D4jProjectLayout) -> bool:
+        """Generate minimal `.project` and `.classpath` for Ant-only Defects4J repos so `jdtls` resolves symbols."""
+        workdir = layout.work_dir
+        probe = self.backend.exec_bash(
+            (
+                "if [ -f pom.xml ] || [ -f build.gradle ] || [ -f build.gradle.kts ] "
+                "|| [ -f .project ] || [ -f .classpath ]; then "
+                "echo '__SPG_HAS_BUILD_DESC__'; "
+                "fi"
+            ),
+            workdir=workdir,
+            with_d4j_env=False,
+            use_inner_timeout=False,
+        )
+        if probe.returncode == 0 and "__SPG_HAS_BUILD_DESC__" in probe.stdout:
+            return False
+
+        proj_name = _xml_escape(f"{layout.project}_{layout.version}")
+        project_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<projectDescription>\n"
+            f"  <name>{proj_name}</name>\n"
+            "  <comment></comment>\n"
+            "  <projects></projects>\n"
+            "  <buildSpec>\n"
+            "    <buildCommand>\n"
+            "      <name>org.eclipse.jdt.core.javabuilder</name>\n"
+            "      <arguments></arguments>\n"
+            "    </buildCommand>\n"
+            "  </buildSpec>\n"
+            "  <natures>\n"
+            "    <nature>org.eclipse.jdt.core.javanature</nature>\n"
+            "  </natures>\n"
+            "</projectDescription>\n"
+        )
+
+        cp_lines = ['<?xml version="1.0" encoding="UTF-8"?>', "<classpath>"]
+        for src_path in (layout.dir_src_classes, layout.dir_src_tests):
+            cleaned_src = src_path.strip("/")
+            if cleaned_src:
+                cp_lines.append(f'  <classpathentry kind="src" path="{_xml_escape(cleaned_src)}"/>')
+        cp_lines.append('  <classpathentry kind="con" path="org.eclipse.jdt.launching.JRE_CONTAINER"/>')
+        seen_libs: set[str] = set()
+        for entry in layout.cp_test.split(":"):
+            cleaned = entry.strip()
+            if cleaned and cleaned.endswith(".jar") and cleaned not in seen_libs:
+                seen_libs.add(cleaned)
+                cp_lines.append(f'  <classpathentry kind="lib" path="{_xml_escape(cleaned)}"/>')
+        output_bin = layout.dir_bin_classes.strip("/") or "bin"
+        cp_lines.append(f'  <classpathentry kind="output" path="{_xml_escape(output_bin)}"/>')
+        cp_lines.append("</classpath>\n")
+        classpath_xml = "\n".join(cp_lines)
+
+        prev_workdir = self.backend.active_work_root
+        prev_state = self.backend.state
+        prev_base_ref = self.backend.base_ref
+        switched_workdir = prev_workdir != workdir
+        if switched_workdir:
+            self.backend.set_active_workdir(workdir, base_ref=prev_base_ref, state=prev_state)
+        try:
+            self.backend.write_file(".project", project_xml, track_injected=False)
+            self.backend.write_file(".classpath", classpath_xml, track_injected=False)
+            self.backend.exec_bash(
+                (
+                    "if [ -d .git ]; then "
+                    "mkdir -p .git/info && touch .git/info/exclude && "
+                    'grep -qxF ".project" .git/info/exclude || echo ".project" >> .git/info/exclude; '
+                    'grep -qxF ".classpath" .git/info/exclude || echo ".classpath" >> .git/info/exclude; '
+                    "fi"
+                ),
+                workdir=workdir,
+                with_d4j_env=False,
+                use_inner_timeout=False,
+            )
+        finally:
+            if switched_workdir and prev_workdir is not None:
+                self.backend.set_active_workdir(prev_workdir, base_ref=prev_base_ref, state=prev_state)
+        return True
 
     def export_property(self, prop_name: str, *, workdir: str | None = None) -> str:
         """Export a single Defects4J property from `workdir` (or active workdir)."""

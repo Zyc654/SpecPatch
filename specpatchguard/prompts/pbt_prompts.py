@@ -24,6 +24,7 @@ CROSS_REP_END_MARKER = "__SPG_CROSS_REP_JSON_END__"
 
 SPEC_EXTRACTION_SYSTEM_PROMPT = """You are a formal specification and property-based test (PBT) engineer for Java Defects4J bugs.
 Your job is to derive executable Pre/Post specifications, concrete boundary seed inputs, and optional read-only anchor infection probes for the PRE-PATCH buggy program (Patch-Blind: you must NEVER assume or inspect any candidate patch).
+Write ALL reasoning, analysis, summaries, notes, rationales, and JSON string values strictly in English.
 
 Output strictly ONE ```json code block with these keys:
 - "preconditions": list of human/machine-readable precondition constraints restricting inputs to valid reachable domains (no null/type noise outside contract)
@@ -50,7 +51,8 @@ Output strictly ONE ```json code block with these keys:
 """
 
 CROSS_REP_TIER_A_SYSTEM_PROMPT = """You are a clean-room software specification engineer.
-You will receive ONLY the natural-language bug intent summary, the Java method signature + Javadoc, failing test expectations, and boundary notes — you are intentionally NOT shown the buggy Java implementation so your Python reference model does not replicate Java implementation mistakes.
+You will receive ONLY the natural-language bug intent summary (plus structured parameter/field/local_var semantics, callee contracts, and structured defect intent when available), the Java method signature + Javadoc, failing test expectations, and boundary notes — you are intentionally NOT shown the buggy Java implementation so your Python reference model does not replicate Java implementation mistakes.
+Write ALL reasoning, analysis, summaries, notes, rationales, and JSON string values strictly in English.
 
 Write ONE self-contained Python script inside a single ```python code block that:
 1. Implements a clean-room Python reference model `ref_impl(...)` matching the Java method signature semantics.
@@ -88,6 +90,20 @@ def _format_anchor_summary(anchor: DiffAnchor) -> str:
     )
 
 
+def _format_structured_semantics(intent_pack: IntentContextPack) -> str:
+    """Format Agent 1's structured semantic tables cleanly for intent-driven modeling."""
+    payload: dict[str, Any] = {}
+    if intent_pack.parameter_field_semantics:
+        payload["parameter_field_semantics"] = intent_pack.parameter_field_semantics
+    if intent_pack.callee_contracts:
+        payload["callee_contracts"] = intent_pack.callee_contracts
+    if intent_pack.structured_defect_intent:
+        payload["structured_defect_intent"] = intent_pack.structured_defect_intent
+    if not payload:
+        return "[None provided]"
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def build_spec_extraction_prompt(intent_pack: IntentContextPack) -> str:
     """Build initial Pre/Post specification + seed input extraction prompt for Agent 2."""
     sigs = "\n\n".join(_format_signature_brief(m) for m in intent_pack.target_methods) or "[No signature parsed]"
@@ -109,10 +125,13 @@ def build_spec_extraction_prompt(intent_pack: IntentContextPack) -> str:
         ensure_ascii=False,
         indent=2,
     )
+    semantics_block = _format_structured_semantics(intent_pack)
 
     return (
         f"Bug ID: {intent_pack.bug_id} | Tier: {intent_pack.tier}\n"
+        f"Write ALL reasoning, analysis, summaries, notes, rationales, and JSON string values strictly in English.\n"
         f"Bug Intent Summary:\n{intent_pack.bug_intent_summary}\n\n"
+        f"# Structured Semantic Tables (Intent, Variables, Callee Contracts)\n{semantics_block}\n\n"
         f"# Target Method Signatures\n{sigs}\n\n"
         f"# Pre-Patch Anchors (Patch-Blind)\n{anchors}\n\n"
         f"# Failing Tests\n{tests}\n\n"
@@ -134,6 +153,7 @@ def build_cross_rep_tier_a_prompt(
         for t in intent_pack.failing_tests
     ) or "[No failing test snippet]"
     notes = "\n".join(f"- {note}" for note in intent_pack.boundary_context.notes) or "- None"
+    semantics_block = _format_structured_semantics(intent_pack)
 
     sampling_instruction = (
         f"Use `@given(...)` and `@settings(max_examples={max_examples}, deadline=None, database=None)` "
@@ -151,8 +171,11 @@ def build_cross_rep_tier_a_prompt(
     )
 
     return (
-        f"Clean-room Python Cross-Representation Boundary Exploration for `{intent_pack.bug_id}`.\n\n"
+        f"Clean-room Python Cross-Representation Boundary Exploration for `{intent_pack.bug_id}`.\n"
+        "Model by intent using the summary, structured semantic tables, signature/Javadoc, and test expectations.\n"
+        "Write ALL reasoning, analysis, summaries, notes, rationales, and JSON string values strictly in English.\n\n"
         f"# Intended Behavior Summary\n{intent_pack.bug_intent_summary}\n\n"
+        f"# Structured Semantic Tables (Intent, Variables, Callee Contracts)\n{semantics_block}\n\n"
         f"# Target Method Signature & Javadoc\n{sigs}\n\n"
         f"# Bug Report\n{report_text}\n\n"
         f"# Failing Test Expectations\n{tests}\n\n"
@@ -177,6 +200,7 @@ def build_cross_rep_fix_prompt(
     )
     return (
         "Your previous Python boundary-input script failed validation or execution.\n"
+        "Write ALL reasoning, analysis, summaries, notes, rationales, and JSON string values strictly in English.\n"
         f"{mode_hint}\n\n"
         f"Error:\n```\n{error_output.strip()}\n```\n\n"
         f"Previous script:\n```python\n{previous_code.strip()}\n```\n\n"
@@ -190,6 +214,7 @@ def build_junit_syntax_fix_prompt(junit_source: str, compile_error: str) -> str:
     """Ask LLM to fix JUnit 4 / JDK 8 compilation errors while preserving `[SPECPATCHGUARD_CASE]` markers."""
     return (
         "The generated JUnit 4 test harness failed to compile under Java 8 / Defects4J.\n"
+        "Write ALL reasoning, comments, and assertions strictly in English.\n"
         "Fix the compilation error while keeping:\n"
         "1. JDK 8 compatibility (no `List.of`, `Map.of`, `var`, switch expressions, or text blocks).\n"
         "2. JUnit 4 annotations (`org.junit.Test`) and `[SPECPATCHGUARD_CASE]` JSON logging format intact.\n"
@@ -227,7 +252,8 @@ def build_pbt_refinement_prompt(
     }
 
     return (
-        f"Refinement Round {round_idx}/{max_rounds} on PRE-PATCH buggy Java code for `{intent_pack.bug_id}`.\n\n"
+        f"Refinement Round {round_idx}/{max_rounds} on PRE-PATCH buggy Java code for `{intent_pack.bug_id}`.\n"
+        "Write ALL reasoning, analysis, summaries, notes, rationales, and JSON string values strictly in English.\n\n"
         "Analyze the Java sandbox execution results:\n"
         "- If error_cases contain irrelevant precondition violations (e.g. null/illegal inputs outside the method's contract), "
         "tighten `preconditions` and list their `case_id`s in `excluded_case_ids`.\n"

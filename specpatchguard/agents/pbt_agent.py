@@ -14,7 +14,14 @@ import re
 from typing import Any
 
 from ..analysis.tool_registry import ToolDispatcher
-from ..core.config_loader import Settings, atomic_json
+from ..core.cache_utils import (
+    compute_anchor_methods_hash,
+    load_valid_cache,
+    resolve_cache_path,
+    sanitize_cache_segment,
+    save_cache_atomic,
+)
+from ..core.config_loader import Settings
 from .intent_agent import _assert_dispatcher_patch_blind
 from ..data.schemas import (
     CrossRepResult,
@@ -482,6 +489,19 @@ class PbtSpecAgent:
         assert last_run_res is not None  # pragma: no cover
         return last_run_res, current_spec, syntax_history
 
+    @staticmethod
+    def _step5_cache_path(
+        bug_id: str,
+        anchors: list[Any],
+        target_methods: list[Any],
+        tier: TierType,
+        cache_dir: Path,
+    ) -> Path:
+        safe_bug = sanitize_cache_segment(bug_id)
+        anchor_hash = compute_anchor_methods_hash(anchors, target_methods)
+        safe_tier = sanitize_cache_segment(tier)
+        return resolve_cache_path(cache_dir, "pbt", f"{safe_bug}__{anchor_hash}__{safe_tier}__step5_spec.json")
+
     def generate_and_refine(
         self,
         intent_pack: IntentContextPack,
@@ -490,9 +510,42 @@ class PbtSpecAgent:
         dispatcher: ToolDispatcher | None = None,
         persist: bool = False,
         cache_dir: Path | None = None,
+        force_refresh: bool | None = None,
     ) -> SpecRefinementResult:
         """Run Spec extraction + Cross-Rep + Java D4J sandbox refinement loop on buggy `P`."""
         self._assert_sandbox_patch_blind(dispatcher)
+
+        use_cache = persist or cache_dir is not None
+        target_cache_dir = Path(cache_dir) if cache_dir is not None else self.settings.spec_cache_dir
+        eff_force_refresh = self.settings.force_refresh if force_refresh is None else bool(force_refresh)
+        step5_cache_path = (
+            self._step5_cache_path(
+                intent_pack.bug_id,
+                intent_pack.anchors,
+                intent_pack.target_methods,
+                intent_pack.tier,
+                target_cache_dir,
+            )
+            if use_cache
+            else None
+        )
+        if step5_cache_path is not None:
+            cached = load_valid_cache(
+                step5_cache_path,
+                force_refresh=eff_force_refresh,
+                validator=lambda d: (
+                    d.get("bug_id") == intent_pack.bug_id
+                    and d.get("tier") == intent_pack.tier
+                    and d.get("status") in {"ok", "partial"}
+                ),
+            )
+            if cached is not None:
+                try:
+                    loaded = SpecRefinementResult.from_dict(cached)
+                    loaded.patch_id = intent_pack.patch_id
+                    return loaded
+                except (KeyError, TypeError, ValueError):
+                    pass
 
         spec, seed_inputs, receiver_setup, probes, probe_errors, spec_degraded, spec_tool_records = (
             self._extract_initial_spec(intent_pack, dispatcher=dispatcher)
@@ -501,7 +554,11 @@ class PbtSpecAgent:
             probes = []
 
         cross_rep_strategy = self.registry.get_cross_rep(intent_pack.tier)
-        cross_rep_res = cross_rep_strategy.generate_candidates(intent_pack, self.settings.pipeline)
+        cross_rep_cfg = dict(self.settings.pipeline)
+        if use_cache:
+            cross_rep_cfg["cache_dir"] = str(target_cache_dir)
+            cross_rep_cfg["force_refresh"] = eff_force_refresh
+        cross_rep_res = cross_rep_strategy.generate_candidates(intent_pack, cross_rep_cfg)
 
         all_candidates = _merge_candidate_inputs(seed_inputs, cross_rep_res.candidate_inputs)
         soft_candidates = list(cross_rep_res.soft_spec_candidates)
@@ -532,7 +589,7 @@ class PbtSpecAgent:
                 refinement_history=history,
                 status="tier_b_placeholder",
             )
-            self._maybe_persist(result, persist=persist, cache_dir=cache_dir)
+            self._maybe_persist(result, persist=persist, cache_dir=cache_dir, cache_path=step5_cache_path)
             return result
 
         if not all_candidates:
@@ -548,7 +605,7 @@ class PbtSpecAgent:
                 refinement_history=history,
                 status="degraded_no_candidates",
             )
-            self._maybe_persist(result, persist=persist, cache_dir=cache_dir)
+            self._maybe_persist(result, persist=persist, cache_dir=cache_dir, cache_path=step5_cache_path)
             return result
 
         max_refine_rounds = int(self.settings.pipeline.get("pbt_refine_max_rounds", 5))
@@ -582,7 +639,7 @@ class PbtSpecAgent:
                 refinement_history=history,
                 status=status,
             )
-            self._maybe_persist(result, persist=persist, cache_dir=cache_dir)
+            self._maybe_persist(result, persist=persist, cache_dir=cache_dir, cache_path=step5_cache_path)
             return result
 
         for round_idx in range(1, max_refine_rounds + 1):
@@ -755,7 +812,7 @@ class PbtSpecAgent:
             refinement_history=history,
             status=status,
         )
-        self._maybe_persist(result, persist=persist, cache_dir=cache_dir)
+        self._maybe_persist(result, persist=persist, cache_dir=cache_dir, cache_path=step5_cache_path)
         return result
 
     def _maybe_persist(
@@ -764,11 +821,12 @@ class PbtSpecAgent:
         *,
         persist: bool,
         cache_dir: Path | None,
+        cache_path: Path | None = None,
     ) -> None:
-        if not persist and cache_dir is None:
+        if result.status not in {"ok", "partial"}:
             return
-        target_dir = cache_dir or self.settings.spec_cache_dir
-        safe_bug = result.bug_id.replace("\\", "_").replace("/", "_").replace("::", "_").replace("..", "_")
-        safe_patch = result.patch_id.replace("\\", "_").replace("/", "_").replace("::", "_").replace("..", "_")
-        out_path = target_dir / f"{safe_bug}__{safe_patch}__step5_spec.json"
-        atomic_json(result.to_dict(), out_path)
+        if not persist and cache_dir is None and cache_path is None:
+            return
+        if cache_path is None:
+            return
+        save_cache_atomic(cache_path, result.to_dict())

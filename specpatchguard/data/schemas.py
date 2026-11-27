@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
-TierType = Literal["tier_a", "tier_b"]
+TierType = Literal["tier_a", "tier_b", "tier_c"]
 VerdictType = Literal["CORRECT", "OVERFITTING", "UNCERTAIN"]
 AnchorKind = Literal["modify", "add_only", "delete_only", "context_only"]
+ArbitrationVerdictType = Literal["pending", "patch_overfitting", "python_semantic_gap", "inconclusive"]
 
 
 def _as_dict_list(items: Any) -> list[dict[str, Any]]:
@@ -525,6 +526,9 @@ class IntentContextPack:
     boundary_context: BoundaryContext = field(default_factory=BoundaryContext)
     tier_decision: TierDecision | None = None
     extra_context: dict[str, Any] = field(default_factory=dict)
+    parameter_field_semantics: list[dict[str, Any]] = field(default_factory=list)
+    callee_contracts: list[dict[str, Any]] = field(default_factory=list)
+    structured_defect_intent: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -541,12 +545,16 @@ class IntentContextPack:
             "boundary_context": self.boundary_context.to_dict(),
             "tier_decision": self.tier_decision.to_dict() if self.tier_decision else None,
             "extra_context": dict(self.extra_context),
+            "parameter_field_semantics": _as_dict_list(self.parameter_field_semantics),
+            "callee_contracts": _as_dict_list(self.callee_contracts),
+            "structured_defect_intent": dict(self.structured_defect_intent),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> IntentContextPack:
         raw_td = data.get("tier_decision")
         raw_bc = data.get("boundary_context")
+        raw_sdi = data.get("structured_defect_intent")
         return cls(
             bug_id=str(data["bug_id"]),
             patch_id=str(data["patch_id"]),
@@ -561,6 +569,9 @@ class IntentContextPack:
             boundary_context=BoundaryContext.from_dict(raw_bc) if raw_bc else BoundaryContext(),
             tier_decision=TierDecision.from_dict(raw_td) if raw_td else None,
             extra_context=dict(data.get("extra_context", {})),
+            parameter_field_semantics=_as_dict_list(data.get("parameter_field_semantics")),
+            callee_contracts=_as_dict_list(data.get("callee_contracts")),
+            structured_defect_intent=dict(raw_sdi) if isinstance(raw_sdi, dict) else {},
         )
 
 
@@ -747,6 +758,91 @@ class HarnessRunResult:
 
 
 @dataclass
+class CalibrationReport:
+    """Bilateral calibration gate report verifying Cross-Rep proxy on passing and failing cases."""
+
+    calibrated: bool = False
+    passing_checked: int = 0
+    passing_agreed: int = 0
+    passing_agreement_rate: float = 0.0
+    bug_checked: int = 0
+    bug_aligned: int = 0
+    bug_side_aligned: bool = False
+    reason: str = ""
+    details: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "calibrated": self.calibrated,
+            "passing_checked": self.passing_checked,
+            "passing_agreed": self.passing_agreed,
+            "passing_agreement_rate": self.passing_agreement_rate,
+            "bug_checked": self.bug_checked,
+            "bug_aligned": self.bug_aligned,
+            "bug_side_aligned": self.bug_side_aligned,
+            "reason": self.reason,
+            "details": _as_dict_list(self.details),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CalibrationReport:
+        return cls(
+            calibrated=bool(data.get("calibrated", False)),
+            passing_checked=int(data.get("passing_checked", 0)),
+            passing_agreed=int(data.get("passing_agreed", 0)),
+            passing_agreement_rate=float(data.get("passing_agreement_rate", 0.0)),
+            bug_checked=int(data.get("bug_checked", 0)),
+            bug_aligned=int(data.get("bug_aligned", 0)),
+            bug_side_aligned=bool(data.get("bug_side_aligned", False)),
+            reason=str(data.get("reason", "")),
+            details=_as_dict_list(data.get("details")),
+        )
+
+
+@dataclass
+class DisagreementCase:
+    """Single-input disagreement triple `(x*, P(x*), P'(x*), M_py(x*))` for arbitration."""
+
+    case_id: str
+    input_args: list[Any]
+    target_patch_branch: str
+    buggy_output: str
+    patched_output: str
+    python_proxy_output: str | None = None
+    probe_source: str = "patch_targeted"
+    arbitration_verdict: ArbitrationVerdictType = "pending"
+    arbitration_rationale: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "case_id": self.case_id,
+            "input_args": list(self.input_args),
+            "target_patch_branch": self.target_patch_branch,
+            "buggy_output": self.buggy_output,
+            "patched_output": self.patched_output,
+            "python_proxy_output": self.python_proxy_output,
+            "probe_source": self.probe_source,
+            "arbitration_verdict": self.arbitration_verdict,
+            "arbitration_rationale": self.arbitration_rationale,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DisagreementCase:
+        raw_proxy = data.get("python_proxy_output")
+        return cls(
+            case_id=str(data["case_id"]),
+            input_args=list(data.get("input_args", [])),
+            target_patch_branch=str(data.get("target_patch_branch", "")),
+            buggy_output=str(data.get("buggy_output", "")),
+            patched_output=str(data.get("patched_output", "")),
+            python_proxy_output=str(raw_proxy) if raw_proxy is not None else None,
+            probe_source=str(data.get("probe_source", "patch_targeted")),
+            arbitration_verdict=data.get("arbitration_verdict", "pending"),
+            arbitration_rationale=str(data.get("arbitration_rationale", "")),
+        )
+
+
+@dataclass
 class FrozenSpecBundle:
     """Immutable specification bundle frozen by Agent 3 before Judge sees the candidate patch."""
 
@@ -758,6 +854,7 @@ class FrozenSpecBundle:
     soft_spec_candidates: list[SoftSpecCandidate] = field(default_factory=list)
     schema_version: str = "1.0"
     metadata: dict[str, Any] = field(default_factory=dict)
+    calibration_report: CalibrationReport | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -769,10 +866,14 @@ class FrozenSpecBundle:
             "soft_spec_candidates": [s.to_dict() for s in self.soft_spec_candidates],
             "schema_version": self.schema_version,
             "metadata": dict(self.metadata),
+            "calibration_report": (
+                self.calibration_report.to_dict() if self.calibration_report else None
+            ),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> FrozenSpecBundle:
+        raw_cal = data.get("calibration_report")
         return cls(
             bug_id=str(data["bug_id"]),
             patch_id=str(data["patch_id"]),
@@ -784,6 +885,7 @@ class FrozenSpecBundle:
             ],
             schema_version=str(data.get("schema_version", "1.0")),
             metadata=dict(data.get("metadata", {})),
+            calibration_report=CalibrationReport.from_dict(raw_cal) if raw_cal else None,
         )
 
 
@@ -799,6 +901,7 @@ class JudgeVerdict:
     lsp_evidence: list[dict[str, Any]] = field(default_factory=list)
     soft_spec_findings: list[dict[str, Any]] = field(default_factory=list)
     rationale: str = ""
+    disagreement_cases: list[DisagreementCase] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -810,6 +913,7 @@ class JudgeVerdict:
             "lsp_evidence": _as_dict_list(self.lsp_evidence),
             "soft_spec_findings": _as_dict_list(self.soft_spec_findings),
             "rationale": self.rationale,
+            "disagreement_cases": [c.to_dict() for c in self.disagreement_cases],
         }
 
     @classmethod
@@ -823,6 +927,9 @@ class JudgeVerdict:
             lsp_evidence=_as_dict_list(data.get("lsp_evidence")),
             soft_spec_findings=_as_dict_list(data.get("soft_spec_findings")),
             rationale=str(data.get("rationale", "")),
+            disagreement_cases=[
+                DisagreementCase.from_dict(item) for item in data.get("disagreement_cases", [])
+            ],
         )
 
 

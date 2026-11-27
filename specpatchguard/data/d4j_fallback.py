@@ -13,6 +13,7 @@ from ..analysis.ast_context import (
     _strip_comments_and_strings,
 )
 from ..analysis.protocols import resolve_repo_rel_path
+from ..core.cache_utils import load_valid_cache, resolve_cache_path, sanitize_cache_segment, save_cache_atomic
 from ..core.config_loader import Settings
 from ..core.doctor import CommandRunner, default_runner
 from .schemas import BugReport, DiffHunk, FailingTestRecord, SubPatchSlice
@@ -133,6 +134,8 @@ class DockerD4jFallbackProvider:
         run_trigger_tests: bool = False,
         include_d4j_summary: bool = False,
         runner: CommandRunner | None = None,
+        cache_dir: Path | None = None,
+        force_refresh: bool = False,
     ) -> None:
         if not image_name or not image_name.strip():
             raise D4jFallbackError("image_name cannot be empty")
@@ -147,9 +150,12 @@ class DockerD4jFallbackProvider:
         self.run_trigger_tests = run_trigger_tests
         self.include_d4j_summary = include_d4j_summary
         self._runner = runner or default_runner
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.force_refresh = bool(force_refresh)
         self._checked_out: dict[tuple[str, int], str] = {}
         self._info_cache: dict[tuple[str, int], str] = {}
         self._file_cache: dict[tuple[str, int, str], str | None] = {}
+        self._refreshed_fields: set[tuple[str, int, str]] = set()
 
     @classmethod
     def from_settings(
@@ -160,6 +166,8 @@ class DockerD4jFallbackProvider:
         run_trigger_tests: bool = False,
         include_d4j_summary: bool = False,
         runner: CommandRunner | None = None,
+        cache_dir: Path | None = None,
+        force_refresh: bool | None = None,
     ) -> DockerD4jFallbackProvider:
         # Docker/D4J settings are validated and marked with SERVER_CONFIG_REQUIRED in core/config_loader.py.
         return cls(
@@ -172,7 +180,40 @@ class DockerD4jFallbackProvider:
             run_trigger_tests=run_trigger_tests,
             include_d4j_summary=include_d4j_summary,
             runner=runner,
+            cache_dir=cache_dir if cache_dir is not None else settings.spec_cache_dir,
+            force_refresh=settings.force_refresh if force_refresh is None else bool(force_refresh),
         )
+
+    def _meta_cache_path(self, project: str, bug_num: int) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        safe_bug = sanitize_cache_segment(f"{project}-{bug_num}")
+        return resolve_cache_path(self.cache_dir, "d4j_meta", f"{safe_bug}__fallback_meta.json")
+
+    def _load_meta_dict(self, project: str, bug_num: int, *, bypass_force_refresh: bool = False) -> dict[str, Any] | None:
+        cache_path = self._meta_cache_path(project, bug_num)
+        if cache_path is None:
+            return None
+        bug_id = f"{project}-{bug_num}"
+        eff_force = False if bypass_force_refresh else self.force_refresh
+        return load_valid_cache(
+            cache_path,
+            force_refresh=eff_force,
+            validator=lambda d: d.get("bug_id") == bug_id,
+        )
+
+    def _save_meta_fields(self, project: str, bug_num: int, updates: dict[str, Any]) -> None:
+        cache_path = self._meta_cache_path(project, bug_num)
+        if cache_path is None:
+            return
+        bug_id = f"{project}-{bug_num}"
+        existing = self._load_meta_dict(project, bug_num, bypass_force_refresh=True) or {}
+        merged: dict[str, Any] = {
+            "bug_id": bug_id,
+            **existing,
+            **updates,
+        }
+        save_cache_atomic(cache_path, merged)
 
     @staticmethod
     def _validate_bug_coords(project: str, bug_num: int) -> tuple[str, int]:
@@ -222,8 +263,18 @@ class DockerD4jFallbackProvider:
         proj, num = self._validate_bug_coords(project, bug_num)
         key = (proj, num)
         if key not in self._info_cache:
+            disk = self._load_meta_dict(
+                proj, num, bypass_force_refresh=(proj, num, "d4j_info") in self._refreshed_fields
+            )
+            if isinstance(disk, dict) and isinstance(disk.get("d4j_info"), str) and disk["d4j_info"]:
+                self._info_cache[key] = disk["d4j_info"]
+                return self._info_cache[key]
             rc, out, _ = self._run_shell(f"defects4j info -p {shlex.quote(proj)} -b {num}")
-            self._info_cache[key] = _normalize_lf(out) if rc == 0 else ""
+            info_text = _normalize_lf(out) if rc == 0 else ""
+            self._info_cache[key] = info_text
+            self._refreshed_fields.add((proj, num, "d4j_info"))
+            if info_text:
+                self._save_meta_fields(proj, num, {"d4j_info": info_text})
         return self._info_cache[key]
 
     def fetch_source_file(self, project: str, bug_num: int, rel_path: str) -> str | None:
@@ -244,31 +295,68 @@ class DockerD4jFallbackProvider:
         """Build a `BugReport` from `defects4j info` without leaking commit summaries by default."""
         proj, num = self._validate_bug_coords(project, bug_num)
         bug_id = f"{proj}-{num}"
+        variant_key = "with_summary" if self.include_d4j_summary else "no_summary"
+        disk = self._load_meta_dict(
+            proj, num, bypass_force_refresh=(proj, num, f"bug_report:{variant_key}") in self._refreshed_fields
+        )
+        if isinstance(disk, dict):
+            reports_map = disk.get("bug_report_entries")
+            if isinstance(reports_map, dict) and isinstance(reports_map.get(variant_key), dict):
+                try:
+                    cached_report = BugReport.from_dict(reports_map[variant_key])
+                    if cached_report.bug_id == bug_id:
+                        return cached_report
+                except (KeyError, TypeError, ValueError):
+                    pass
+
         info_text = self._get_d4j_info(proj, num)
         if not info_text:
             return BugReport(bug_id=bug_id, title="", description="", available=False)
         title, summary_body, root_cause = _parse_d4j_info_output(info_text)
         if not self.include_d4j_summary:
             if not root_cause:
-                return BugReport(bug_id=bug_id, title="", description="", available=False)
-            return BugReport(
+                report = BugReport(bug_id=bug_id, title="", description="", available=False)
+            else:
+                report = BugReport(
+                    bug_id=bug_id,
+                    title=f"{bug_id} triggering test failure",
+                    description=root_cause,
+                    available=True,
+                )
+        else:
+            desc_parts = [part for part in (summary_body, root_cause) if part]
+            description = "\n\n".join(desc_parts)
+            report = BugReport(
                 bug_id=bug_id,
-                title=f"{bug_id} triggering test failure",
-                description=root_cause,
-                available=True,
+                title=title or f"{bug_id} triggering failure",
+                description=description,
+                available=bool(title or description),
             )
-        desc_parts = [part for part in (summary_body, root_cause) if part]
-        description = "\n\n".join(desc_parts)
-        return BugReport(
-            bug_id=bug_id,
-            title=title or f"{bug_id} triggering failure",
-            description=description,
-            available=bool(title or description),
-        )
+
+        self._refreshed_fields.add((proj, num, f"bug_report:{variant_key}"))
+        existing = self._load_meta_dict(proj, num, bypass_force_refresh=True) or {}
+        existing_entries = dict(existing.get("bug_report_entries") or {})
+        existing_entries[variant_key] = report.to_dict()
+        self._save_meta_fields(proj, num, {"bug_report_entries": existing_entries})
+        return report
 
     def fetch_failing_tests(self, project: str, bug_num: int) -> list[FailingTestRecord]:
         """Fetch triggering tests and test method source directly from Docker Defects4J."""
         proj, num = self._validate_bug_coords(project, bug_num)
+        trig_key = "with_trigger_run" if self.run_trigger_tests else "no_trigger_run"
+        disk = self._load_meta_dict(
+            proj, num, bypass_force_refresh=(proj, num, f"failing_tests:{trig_key}") in self._refreshed_fields
+        )
+        if isinstance(disk, dict):
+            tests_map = disk.get("failing_tests_entries")
+            if isinstance(tests_map, dict) and isinstance(tests_map.get(trig_key), list):
+                try:
+                    cached_tests = [FailingTestRecord.from_dict(item) for item in tests_map[trig_key]]
+                    if cached_tests:
+                        return cached_tests
+                except (KeyError, TypeError, ValueError):
+                    pass
+
         workdir = self.ensure_checkout(proj, num)
 
         rc_trig, out_trig, _ = self._run_shell(
@@ -327,6 +415,12 @@ class DockerD4jFallbackProvider:
                     stack_trace=stack_trace,
                 )
             )
+        if records:
+            self._refreshed_fields.add((proj, num, f"failing_tests:{trig_key}"))
+            existing = self._load_meta_dict(proj, num, bypass_force_refresh=True) or {}
+            existing_tests = dict(existing.get("failing_tests_entries") or {})
+            existing_tests[trig_key] = [r.to_dict() for r in records]
+            self._save_meta_fields(proj, num, {"failing_tests_entries": existing_tests})
         return records
 
     def build_function_slices_for_hunks(

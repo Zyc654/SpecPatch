@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import re
+import shlex
+import time
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from ..core.doctor import CommandRunner, default_runner
@@ -186,6 +188,7 @@ class DockerExecExecutor:
         readonly_prepatch: bool = True,
         runner: CommandRunner | None = None,
         command_timeout_sec: int = DEFAULT_COMMAND_TIMEOUT_SEC,
+        use_inner_timeout: bool = True,
     ) -> None:
         if not container_name or not container_name.strip():
             raise ToolExecutionError("container_name cannot be empty")
@@ -198,18 +201,43 @@ class DockerExecExecutor:
         self.readonly_prepatch = readonly_prepatch
         self._runner = runner or default_runner
         self.command_timeout_sec = command_timeout_sec
+        self.use_inner_timeout = bool(use_inner_timeout)
 
-    def exec_command(self, argv: list[str], timeout: int | None = None) -> ExecOutput:
+    def exec_command(
+        self,
+        argv: list[str],
+        timeout: int | None = None,
+        *,
+        use_inner_timeout: bool | None = None,
+    ) -> ExecOutput:
         if not argv:
             raise ToolExecutionError("argv cannot be empty")
         eff_timeout = self.command_timeout_sec if timeout is None else timeout
-        docker_cmd = ["docker", "exec", "-w", self.work_root, self.container_name, *argv]
-        rc, out, err = self._runner(docker_cmd, eff_timeout)
+        eff_inner = self.use_inner_timeout if use_inner_timeout is None else bool(use_inner_timeout)
+        if eff_inner:
+            inner_cmd = " ".join(shlex.quote(arg) for arg in argv)
+            wrapped = (
+                f"if command -v timeout >/dev/null 2>&1; then "
+                f"timeout -k 10 {int(eff_timeout)} {inner_cmd}; "
+                f"else {inner_cmd}; fi"
+            )
+            docker_cmd = ["docker", "exec", "-w", self.work_root, self.container_name, "sh", "-c", wrapped]
+            host_timeout = int(eff_timeout) + 15
+        else:
+            docker_cmd = ["docker", "exec", "-w", self.work_root, self.container_name, *argv]
+            host_timeout = int(eff_timeout)
+
+        start = time.monotonic()
+        rc, out, err = self._runner(docker_cmd, host_timeout)
+        elapsed = time.monotonic() - start
+        timed_out = (rc == 124) if eff_inner else (rc == 124 and "timed out" in err.lower())
+        if eff_inner and rc == 137 and (elapsed >= eff_timeout or (not out and not err)):
+            timed_out = True
         return ExecOutput(
             returncode=rc,
             stdout=out,
             stderr=err,
-            timed_out=(rc == 124 and "timed out" in err.lower()),
+            timed_out=timed_out,
         )
 
     def read_file(self, rel_path: str) -> str:

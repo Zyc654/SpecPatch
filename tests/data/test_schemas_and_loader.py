@@ -703,3 +703,183 @@ def test_docker_d4j_fallback_hydrates_missing_pkl_entries(tmp_path: Path) -> Non
     assert summary_only_report.available is False
     assert summary_only_report.title == ""
     assert summary_only_report.description == ""
+
+
+def test_step2_schemas_tier_c_and_structured_semantics() -> None:
+    """Verify TierType 'tier_c', IntentContextPack structured semantic tables, CalibrationReport, and DisagreementCase."""
+    from specpatchguard.data.schemas import (
+        BugReport,
+        CalibrationReport,
+        DisagreementCase,
+        FrozenSpecBundle,
+        IntentContextPack,
+        JudgeVerdict,
+        PrePostSpec,
+        WitnessBank,
+    )
+
+    pack = IntentContextPack(
+        bug_id="Lang-12",
+        patch_id="patch1.diff",
+        project="Lang",
+        tier="tier_c",
+        bug_intent_summary="Generate random string cleanly.",
+        anchors=[],
+        target_methods=[],
+        failing_tests=[],
+        bug_report=BugReport(bug_id="Lang-12"),
+        parameter_field_semantics=[
+            {"name": "count", "kind": "param", "meaning": "number of chars to generate"},
+            {"name": "buffer", "kind": "local_var", "meaning": "output char array"},
+        ],
+        callee_contracts=[
+            {"callee": "nextInt", "role": "RNG", "contract": "returns [0, bound)"}
+        ],
+        structured_defect_intent={"preconditions": ["count >= 0"], "postconditions": ["len == count"]},
+    )
+    roundtrip = IntentContextPack.from_dict(pack.to_dict())
+    assert roundtrip.tier == "tier_c"
+    assert roundtrip.parameter_field_semantics[1]["kind"] == "local_var"
+    assert roundtrip.callee_contracts[0]["callee"] == "nextInt"
+    assert roundtrip.structured_defect_intent["preconditions"] == ["count >= 0"]
+
+    calib = CalibrationReport(
+        calibrated=True,
+        passing_checked=5,
+        passing_agreed=5,
+        passing_agreement_rate=1.0,
+        bug_checked=2,
+        bug_aligned=2,
+        bug_side_aligned=True,
+        reason="ok",
+    )
+    disagree = DisagreementCase(
+        case_id="probe_1",
+        input_args=[0],
+        target_patch_branch="return 0;",
+        buggy_output=-1,
+        patched_output=0,
+        python_proxy_output=0,
+        arbitration_verdict="PATCH_CORRECT",
+        arbitration_rationale="matches spec",
+    )
+    bundle = FrozenSpecBundle(
+        bug_id="Lang-12",
+        patch_id="patch1.diff",
+        tier="tier_c",
+        hard_specs=PrePostSpec(),
+        witness_bank=WitnessBank(),
+        calibration_report=calib,
+    )
+    assert FrozenSpecBundle.from_dict(bundle.to_dict()).calibration_report.calibrated is True
+
+    verdict = JudgeVerdict(
+        bug_id="Lang-12",
+        patch_id="patch1.diff",
+        verdict="COR",
+        disagreement_cases=[disagree],
+    )
+    assert JudgeVerdict.from_dict(verdict.to_dict()).disagreement_cases[0].arbitration_verdict == "PATCH_CORRECT"
+
+
+def test_d4j_fallback_layer0a_disk_cache_reuse_isolation_and_refresh(tmp_path: Path) -> None:
+    """Verify Layer 0a disk cache hits with zero docker calls, mode-key isolation, corrupt recovery, and force_refresh."""
+    docker_calls: list[list[str]] = []
+
+    def fake_runner(argv: list[str], timeout: int) -> tuple[int, str, str]:
+        docker_calls.append(argv)
+        script = argv[-1]
+        if "defects4j info" in script:
+            return (
+                0,
+                "Summary:\n    Commit hint\n"
+                "Root cause in triggering tests:\n"
+                " - org.example.FooTest::testBar:\n"
+                "   AssertionError: bad\n",
+                "",
+            )
+        if "defects4j export" in script and "tests.trigger" in script:
+            return 0, "org.example.FooTest::testBar\n", ""
+        if "defects4j export" in script and "dir.src.tests" in script:
+            return 0, "src/test/java\n", ""
+        if "FooTest.java" in script:
+            return 0, "package org.example;\npublic class FooTest {\n  public void testBar() {}\n}\n", ""
+        return 0, "", ""
+
+    cache_dir = tmp_path / "cache"
+    p1 = DockerD4jFallbackProvider(
+        image_name="img",
+        container_work_root="/workspace/d4j_work",
+        d4j_home="/d4j",
+        java8_home="/j8",
+        container_name="c1",
+        runner=fake_runner,
+        cache_dir=cache_dir,
+    )
+    rep1 = p1.fetch_bug_report("Lang", 12)
+    tests1 = p1.fetch_failing_tests("Lang", 12)
+    assert rep1.available is True
+    assert len(tests1) == 1
+    first_count = len(docker_calls)
+    assert first_count > 0
+
+    meta_file = cache_dir / "d4j_meta" / "Lang-12__fallback_meta.json"
+    assert meta_file.exists()
+
+    # Second provider instance reuses disk cache with ZERO Docker calls
+    p2 = DockerD4jFallbackProvider(
+        image_name="img",
+        container_work_root="/workspace/d4j_work",
+        d4j_home="/d4j",
+        java8_home="/j8",
+        container_name="c1",
+        runner=fake_runner,
+        cache_dir=cache_dir,
+    )
+    docker_calls.clear()
+    rep2 = p2.fetch_bug_report("Lang", 12)
+    tests2 = p2.fetch_failing_tests("Lang", 12)
+    assert docker_calls == []
+    assert rep2.description == rep1.description
+    assert tests2[0].test_method_name == "testBar"
+
+    # Different include_d4j_summary key reuses raw d4j_info stdout (0 docker calls) and isolates cached sections
+    p_with_summary = DockerD4jFallbackProvider(
+        image_name="img",
+        container_work_root="/workspace/d4j_work",
+        d4j_home="/d4j",
+        java8_home="/j8",
+        container_name="c1",
+        include_d4j_summary=True,
+        runner=fake_runner,
+        cache_dir=cache_dir,
+    )
+    rep_sum = p_with_summary.fetch_bug_report("Lang", 12)
+    assert "Commit hint" in rep_sum.description
+    assert docker_calls == []
+    cached_meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert "Commit hint" not in cached_meta["bug_report_entries"]["no_summary"]["description"]
+    assert "Commit hint" in cached_meta["bug_report_entries"]["with_summary"]["description"]
+
+    # Corrupt cache file degrades gracefully and regenerates cleanly
+    meta_file.write_text("{corrupt", encoding="utf-8")
+    docker_calls.clear()
+    rep_rec = p2.fetch_bug_report("Lang", 12)
+    assert rep_rec.available is True
+    assert len(docker_calls) >= 1
+
+    # force_refresh=True bypasses existing valid cache
+    docker_calls.clear()
+    p_force = DockerD4jFallbackProvider(
+        image_name="img",
+        container_work_root="/workspace/d4j_work",
+        d4j_home="/d4j",
+        java8_home="/j8",
+        container_name="c1",
+        runner=fake_runner,
+        cache_dir=cache_dir,
+        force_refresh=True,
+    )
+    _ = p_force.fetch_bug_report("Lang", 12)
+    assert len(docker_calls) >= 1
+

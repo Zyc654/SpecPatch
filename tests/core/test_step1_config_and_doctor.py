@@ -131,7 +131,7 @@ def test_default_config_loads_and_preserves_posix_server_paths():
         assert resolved is not None
         assert resolved.is_file(), f"Missing referenced file for data.{key}: {resolved}"
     assert settings.docker["container_work_root"] == "/workspace/d4j_work"
-    assert settings.docker["host_mount_root"] == "/data/patch_va/d4j_work"
+    assert settings.docker["host_mount_root"] == (PROJECT_ROOT / "d4j_work").resolve().as_posix()
     assert settings.defects4j["d4j_home"] == "/data/public/defects4j"
     assert settings.defects4j["java8_home"] == "/workspace/envs/defects4j"
     assert settings.lsp["jdtls_home"] == "/opt/jdtls"
@@ -230,7 +230,7 @@ def test_explicit_missing_env_file_raises(tmp_path: Path):
         lambda c: c["docker"].__setitem__("timeout_seconds", 0),
         lambda c: c["api"].__setitem__("api_key_env", "123BAD"),
         lambda c: c["lsp"].__setitem__("mode", "disabled"),
-        lambda c: c["pipeline"].__setitem__("target_tier", "tier_c"),
+        lambda c: c["pipeline"].__setitem__("target_tier", "tier_unknown"),
         lambda c: c["api"].__setitem__("extra_body", {"model": "override"}),
         lambda c: c["docker"].__setitem__("container_work_root", "relative/path"),
         lambda c: c["defects4j"].__setitem__("d4j_home", "/bad\npath"),
@@ -474,3 +474,97 @@ def test_env_fallback_parser(tmp_path: Path):
         "LLM_MODEL": "deepseek-chat",
         "EMPTY_KEY": "",
     }
+
+
+def test_backward_compatible_tier_c_force_refresh_and_optional_pipeline_keys(tmp_path: Path):
+    cfg_path, cfg = _make_fixture_workspace(tmp_path)
+    # 1) Omitting optional keys applies backward-compatible defaults
+    base_settings = load_settings(cfg_path)
+    assert base_settings.force_refresh is False
+    assert base_settings.output["force_refresh"] is False
+    assert base_settings.pipeline["max_tier_b_predicates"] == 6
+    assert base_settings.pipeline["tier_b_predicate_proposers"] == 2
+    assert base_settings.pipeline["enable_tier_c_nonexec_python"] is False
+    assert base_settings.pipeline["calibration_min_passing_agreement"] == 0.8
+    assert base_settings.pipeline["calibration_min_passing_samples"] == 2
+    assert base_settings.pipeline["enable_patch_targeted_disagreement"] is True
+    assert base_settings.pipeline["max_disagreement_probes"] == 5
+
+    # 2) Explicit tier_c, output.force_refresh, and all optional pipeline keys load cleanly
+    ext_cfg = copy.deepcopy(cfg)
+    ext_cfg["output"]["force_refresh"] = True
+    ext_cfg["pipeline"]["target_tier"] = "tier_c"
+    ext_cfg["pipeline"].update(
+        {
+            "max_tier_b_predicates": 4,
+            "tier_b_predicate_proposers": 3,
+            "enable_tier_c_nonexec_python": True,
+            "calibration_min_passing_agreement": 0.9,
+            "calibration_min_passing_samples": 4,
+            "enable_patch_targeted_disagreement": False,
+            "max_disagreement_probes": 8,
+        }
+    )
+    atomic_json(ext_cfg, cfg_path)
+    ext_settings = load_settings(cfg_path)
+    assert ext_settings.force_refresh is True
+    assert ext_settings.pipeline["target_tier"] == "tier_c"
+    assert ext_settings.pipeline["max_tier_b_predicates"] == 4
+    assert ext_settings.pipeline["tier_b_predicate_proposers"] == 3
+    assert ext_settings.pipeline["enable_tier_c_nonexec_python"] is True
+    assert ext_settings.pipeline["calibration_min_passing_agreement"] == 0.9
+    assert ext_settings.pipeline["calibration_min_passing_samples"] == 4
+    assert ext_settings.pipeline["enable_patch_targeted_disagreement"] is False
+    assert ext_settings.pipeline["max_disagreement_probes"] == 8
+
+    # 3) Boundary rejections on optional keys
+    for section, key, bad_val in (
+        ("output", "force_refresh", "yes"),
+        ("output", "unknown_output_opt", 1),
+        ("pipeline", "max_tier_b_predicates", 7),
+        ("pipeline", "max_tier_b_predicates", 0),
+        ("pipeline", "tier_b_predicate_proposers", 0),
+        ("pipeline", "enable_tier_c_nonexec_python", 1),
+        ("pipeline", "calibration_min_passing_agreement", 1.2),
+        ("pipeline", "calibration_min_passing_samples", 0),
+        ("pipeline", "enable_patch_targeted_disagreement", "true"),
+        ("pipeline", "max_disagreement_probes", 0),
+        ("pipeline", "unknown_pipeline_opt", True),
+    ):
+        bad_cfg = copy.deepcopy(cfg)
+        bad_cfg[section][key] = bad_val
+        atomic_json(bad_cfg, cfg_path)
+        with pytest.raises(ConfigError):
+            load_settings(cfg_path)
+
+
+def test_docker_host_mount_root_relative_and_explicit_posix(tmp_path: Path) -> None:
+    """Verify docker.host_mount_root supports relative paths, explicit POSIX paths, and rejects blanks."""
+    base_cfg_path = Path(__file__).resolve().parents[2] / "config" / "config.json"
+    cfg = json.loads(base_cfg_path.read_text(encoding="utf-8"))
+
+    # 1) Relative path resolves cleanly with forward slashes
+    cfg_rel = copy.deepcopy(cfg)
+    cfg_rel["docker"]["host_mount_root"] = "../custom_d4j_work"
+    rel_path = tmp_path / "cfg_rel.json"
+    atomic_json(cfg_rel, rel_path)
+    rel_settings = load_settings(rel_path)
+    assert rel_settings.docker["host_mount_root"].endswith("/custom_d4j_work")
+    assert "\\" not in rel_settings.docker["host_mount_root"]
+
+    # 2) Explicit Linux server POSIX path is preserved verbatim
+    cfg_posix = copy.deepcopy(cfg)
+    cfg_posix["docker"]["host_mount_root"] = "/data/patch_va/d4j_work"
+    posix_path = tmp_path / "cfg_posix.json"
+    atomic_json(cfg_posix, posix_path)
+    posix_settings = load_settings(posix_path)
+    assert posix_settings.docker["host_mount_root"] == "/data/patch_va/d4j_work"
+
+    # 3) Blank host_mount_root is rejected
+    cfg_blank = copy.deepcopy(cfg)
+    cfg_blank["docker"]["host_mount_root"] = "   "
+    blank_path = tmp_path / "cfg_blank.json"
+    atomic_json(cfg_blank, blank_path)
+    with pytest.raises(ConfigError, match="host_mount_root"):
+        load_settings(blank_path)
+

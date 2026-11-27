@@ -32,14 +32,17 @@ from .pkl_loader import (
 )
 from .schemas import (
     AnchorKind,
+    ArbitrationVerdictType,
     BoundaryContext,
     BugReport,
+    CalibrationReport,
     CrossRepResult,
     CrossRepStrategy,
     DatasetLoadResult,
     DatasetSpec,
     DiffAnchor,
     DiffHunk,
+    DisagreementCase,
     FailingTestRecord,
     FrozenSpecBundle,
     HarnessRunResult,
@@ -69,8 +72,10 @@ from .tier_classifier import (
 
 __all__ = [
     "AnchorKind",
+    "ArbitrationVerdictType",
     "BoundaryContext",
     "BugReport",
+    "CalibrationReport",
     "CrossRepResult",
     "CrossRepStrategy",
     "D4jFallbackError",
@@ -80,6 +85,7 @@ __all__ = [
     "DatasetSpec",
     "DiffAnchor",
     "DiffHunk",
+    "DisagreementCase",
     "DockerD4jFallbackProvider",
     "FailingTestRecord",
     "FrozenSpecBundle",

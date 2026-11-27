@@ -534,3 +534,95 @@ def test_review_regressions_junit_direct_braceless_probes_and_partial_crash():
             multiline_braceless,
             [AnchorProbeSpec(probe_id="p_ml", file_path="src/Foo.java", line_number=4, observed_expressions=["x"])],
         )
+
+
+def test_d4j_runner_layer0b_layout_cache_and_eclipse_project_files(tmp_path: Path) -> None:
+    """Verify Layer 0b layout cache hit/miss/bypass on reused checkouts and Ant-only Eclipse metadata generation."""
+    import json
+    env = _FakeD4jDockerEnv()
+    recorded_scripts: list[str] = []
+    has_build_desc = False
+    simulate_reused = False
+
+    def wrapped_runner(argv: list[str], timeout: int) -> tuple[int, str, str]:
+        if argv[:2] == ["docker", "exec"]:
+            recorded_scripts.append(argv[-1])
+            if simulate_reused and "__SPG_CHECKOUT_REUSED__" in argv[-1]:
+                return 0, "__SPG_CHECKOUT_REUSED__\n", ""
+            if "[ -f pom.xml ]" in argv[-1]:
+                return (0, "__SPG_HAS_BUILD_DESC__\n" if has_build_desc else "", "")
+        return env.run(argv, timeout)
+
+    backend = DockerSandboxBackend(
+        image_name="d4j-lsp-runtime:latest",
+        container_work_root="/workspace/d4j_work",
+        host_mount_root=str(tmp_path / "mnt"),
+        d4j_home="/data/public/defects4j",
+        java8_home="/workspace/envs/defects4j",
+        mount_host_dir=False,
+        runner=wrapped_runner,
+        stdin_runner=env.run_stdin,
+    )
+    backend.start()
+
+    cache_dir = tmp_path / "spec_cache"
+    runner = Defects4JRunner(backend, cache_dir=cache_dir)
+
+    # 1) First checkout runs defects4j export batch and writes relative-path Layer 0b layout cache
+    layout1 = runner.checkout("Lang", 12)
+    assert any("defects4j export" in s for s in recorded_scripts)
+    cache_file = cache_dir / "d4j_meta" / "Lang-12__12b__layout.json"
+    assert cache_file.exists()
+    cached_json = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert cached_json["bug_id"] == "Lang-12"
+    assert cached_json["version"] == "12b"
+    assert cached_json["work_dir_rel"] == "Lang_12b"
+
+    # 2) Second checkout on reused dir hits Layer 0b cache with ZERO defects4j export calls
+    simulate_reused = True
+    recorded_scripts.clear()
+    layout2 = runner.checkout("Lang", 12)
+    assert layout2.to_dict() == layout1.to_dict()
+    assert not any("defects4j export" in s for s in recorded_scripts)
+
+    # 3) force_refresh=True and session_subdir mismatch bypass cache and re-run export
+    recorded_scripts.clear()
+    _ = runner.checkout("Lang", 12, force_refresh=True)
+    assert any("defects4j export" in s for s in recorded_scripts)
+
+    recorded_scripts.clear()
+    layout_sub = runner.checkout("Lang", 12, session_subdir="sub2")
+    assert layout_sub.work_dir == "/workspace/d4j_work/sub2/Lang_12b"
+    assert any("defects4j export" in s for s in recorded_scripts)
+    sub_cache_file = cache_dir / "d4j_meta" / "Lang-12__12b__sub2__layout.json"
+    assert sub_cache_file.exists()
+    assert json.loads(cache_file.read_text(encoding="utf-8"))["work_dir_rel"] == "Lang_12b"
+
+    # 4) ensure_eclipse_project_files restores prior active_work_root/state and generates .project/.classpath
+    has_build_desc = False
+    recorded_scripts.clear()
+    backend.set_active_workdir("/workspace/d4j_work/Other_9b", state="postpatch")
+    created = runner.ensure_eclipse_project_files(layout1)
+    assert created is True
+    assert backend.active_work_root == "/workspace/d4j_work/Other_9b"
+    assert backend.state == "postpatch"
+    proj_xml = env.files["/workspace/d4j_work/Lang_12b/.project"].decode("utf-8")
+    cp_xml = env.files["/workspace/d4j_work/Lang_12b/.classpath"].decode("utf-8")
+    assert "<name>Lang_12b</name>" in proj_xml
+    assert 'path="src/main/java"' in cp_xml
+    assert 'path="src/test/java"' in cp_xml
+    assert "JRE_CONTAINER" in cp_xml
+    assert any(".git/info/exclude" in s for s in recorded_scripts)
+
+    # checkout(..., ensure_eclipse_files=True) triggers generation even on cache hit
+    env.files.pop("/workspace/d4j_work/Lang_12b/.project", None)
+    _ = runner.checkout("Lang", 12, ensure_eclipse_files=True)
+    assert "/workspace/d4j_work/Lang_12b/.project" in env.files
+
+    # Skips generation cleanly when build descriptor already exists
+    has_build_desc = True
+    env.files.pop("/workspace/d4j_work/Lang_12b/.project", None)
+    skipped = runner.ensure_eclipse_project_files(layout1)
+    assert skipped is False
+    assert "/workspace/d4j_work/Lang_12b/.project" not in env.files
+

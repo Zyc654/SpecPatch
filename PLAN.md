@@ -281,9 +281,10 @@ class TestHarnessStrategy(Protocol):
      - `confirmed_bug_witnesses` 生成强后置断言 / 无原缺陷异常检查；
      - `verified_passing_witnesses` 自动将缺陷版 `P` 的 `observed_buggy_outcome` 固化为回归 `assertEquals` 断言。
 
-3. **`FrozenSpecBundle` 缓存粒度键**：
-   - 缓存键规定为 **`(bug_id, canonical_anchor_methods_hash)`**（对目标修改方法签名列表排序后取短哈希），而非仅按 `bug_id`。
-   - 修改同一组方法的候选补丁完全复用同一份 `FrozenSpecBundle`；若同一缺陷的不同补丁改在不同方法（例如 `caller` vs `callee`，对应 `rule.md` 等价第 8 条），共享 `BugReport` 与触发测试，但独立生成锚点与边界规约，防止张冠李戴。
+3. **`FrozenSpecBundle` 缓存粒度键与多层级复用体系**：
+   - 规约冻结层缓存键规定为 **`(bug_id, canonical_anchor_methods_hash, effective_tier)`**（对目标修改方法签名列表排序后取 12 位短哈希，并带上 `effective_tier` 以防止 Tier-A / Tier-B / Tier-C 消融互相串缓存），而非仅按 `bug_id`。
+   - 修改同一组方法且同一 Tier 的候选补丁完全复用同一份 `FrozenSpecBundle`；若同一缺陷的不同补丁改在不同方法（例如 `caller` vs `callee`，对应 `rule.md` 等价第 8 条），共享 `BugReport` 与触发测试（`d4j_meta`），但独立生成锚点与边界规约，防止张冠李戴。
+   - **完整的多层文件级“存在即复用”路径、共享 Key 计算器与防脏缓存规则见下文 Section 4.7**。
 
 4. **Step 7 Gate 2 `python_model_code` 单输入求值协议**：
    - 复用 Step 5 已约定的洁净室入口函数 **`ref_impl(*args)`**（[pbt_prompts.py](file:///E:/workspace/myown/SpecPatchGuard/specpatchguard/prompts/pbt_prompts.py) 已强制规范）。
@@ -307,14 +308,15 @@ class TestHarnessStrategy(Protocol):
 ### 4.6 Agent 1 显式结构化语义沉淀与 Tier-B 双智能体谓词筛选规范
 
 #### 4.6.1 Agent 1 显式结构化语义契约沉淀（Intent-Driven Modeling Foundation）
-Agent 1 的核心价值不只是输出一段泛泛的 `bug_intent_summary`，而是借助 Docker 内 AST/LSP 工具**显式结构化沉淀三张语义表**并存入 `IntentContextPack`，让下游 Tier-A 与 Tier-B 真正具备足够上下文做到**“按意图建模（Intent-Driven Modeling）”而非“逐行硬翻 Java”**：
-1. **入参 / 类字段语义表（`parameter_field_semantics`）**：
-   - 借助 `get_class_members`、`trace_symbol_usage`、`lsp_hover` 提取并结构化记录每个相关参数、类字段与返回值：`{name, kind ("param" | "field" | "return"), java_type, semantic_role, valid_domain_or_invariants, nullable_or_edge_cases}`。
+Agent 1 的核心价值不只是输出一段泛泛的 `bug_intent_summary`，而是借助 Docker 内 AST/LSP 工具**显式结构化沉淀完整的“方法级设计意图 + 方法内全部关键变量含义 + Callee 契约 + 缺陷/测试意图”**并存入 `IntentContextPack`，让下游 Tier-A / Tier-B / Tier-C 真正具备足够上下文做到**“按意图建模（Intent-Driven Modeling）”而非“逐行硬翻 Java”**：
+1. **入参 / 类字段 / 内部局部变量 / 返回值语义表（`parameter_field_semantics`）**：
+   - 借助 `get_class_members`、`trace_symbol_usage`、`lsp_hover` 与完整缺陷方法体提取并结构化记录每一项符号：`{name, kind ("param" | "field" | "local_var" | "return"), java_type, semantic_role, valid_domain_or_invariants, nullable_or_edge_cases}`。
+   - **必须涵盖方法体内部关键局部变量与状态标志（`local_var`）**（如游标索引、状态布尔位、临时缓冲集合等），不得遗漏。
 2. **Callee 函数契约表（`callee_contracts`）**：
-   - 借助 `lsp_goto_definition` 与 `read_file_lines` 查明锚点方法内关键被调 helper 的真实契约：`{callee_signature, resolved_location, precondition, return_semantics, side_effects, exception_behavior}`，使下游 Cross-Rep / PBT / 决策表无需盲猜或硬内联重型 Callee 实现。
+   - 借助 `lsp_goto_definition` 与 `read_file_lines` 查明锚点方法内关键被调 helper 的真实契约：`{callee_signature, resolved_location, precondition, return_semantics, side_effects, exception_behavior}`，使下游 Cross-Rep / PBT / 决策表 / Tier-C 无需盲猜或硬内联重型 Callee 实现。
 3. **缺陷报告与测试意图结构化摘要（`structured_defect_intent`）**：
-   - 结构化拆分为 `{bug_report_claims, failing_test_assertions, trigger_conditions, expected_postcondition_summary, bug_report_available}`，严格区分“权威失败测试契约”与“Bug Report 症状线索”。
-- **向后兼容增量落地方式**：保留 `IntentContextPack` 既有字段不变，在 `schemas.py` 中以空列表/空字典默认值新增上述 3 个字段；在 `intent_prompts.py`（严格遵守 Section 4.5 纯英文约束）与 `intent_agent.py` 中引导 Agent 1 显式输出并在解析缺失时安全降级为空结构；下游 `pbt_prompts.py`（Tier-A）与 `TierBAbstractDecisionTableStrategy`（Tier-B）直接消费这三张表进行意图建模。
+   - 结合 `bug_intent_summary` 完整记录**目标方法整体设计职责**（不仅停留在表面失败现象），并结构化拆分为 `{bug_report_claims, failing_test_assertions, trigger_conditions, expected_postcondition_summary, bug_report_available}`，严格区分“权威失败测试契约”与“Bug Report 症状线索”。
+- **向后兼容增量落地方式**：保留 `IntentContextPack` 既有字段不变，在 `schemas.py`（归属 Step 2）中以空列表/空字典默认值新增上述 3 个字段；在 `intent_prompts.py`（严格遵守 Section 4.5 纯英文约束）与 `intent_agent.py`（归属 Step 5）中引导 Agent 1 显式输出并在解析缺失时安全降级为空结构；下游 `pbt_prompts.py`（Tier-A）、`TierBAbstractDecisionTableStrategy`（Tier-B）与 `TierCNonExecPythonSpecStrategy`（Tier-C）直接消费这三张表进行意图建模。
 
 #### 4.6.2 Tier-B 谓词空间硬约束（≤ 6 谓词）与双智能体独立打分排名筛选
 为防止复杂/重状态方法在抽象建模时出现谓词爆炸、无关噪声分支干扰或单模型偏见，Tier-B 强制执行**显式硬上限 + 双智能体独立投票排序**：
@@ -344,6 +346,43 @@ Agent 1 的核心价值不只是输出一段泛泛的 `bug_intent_summary`，而
    - `CrossRepResult` 记录 `tier="tier_c"`、`python_model_code=python_intent_code`、`candidates=[]`、`diagnostics={"execution_mode": "non_executable_read_only"}`；
    - Step 6 强制设 `CalibrationReport(calibrated=False, reason="tier_c_non_executable")` 并冻结规约（标记 `tier_c_non_exec`）；
    - Step 7 **严禁**对 Tier-C 调用 `ref_impl(*args)` 或将其当作可执行硬 Oracle，自动跳过依赖执行模型的 Gate 2 分歧挖掘（Gate 1 仅可按配置跑原 D4J `trigger_tests` 回归），直接携带 Tier-C 抽取规约 + `<SimpleBlock>` + LSP + `rule.md` 红线进入 Gate 3/4 语义仲裁。
+
+### 4.7 文件级存在即复用缓存架构与分 Step 存储规范
+
+> [!IMPORTANT]
+> **全流程文件级复用原则**：凡 Patch-Blind 上下文、元数据、跨表达模型与冻结规约，第一次生成后立即通过 `atomic_json` 落盘；后续运行**先判断对应缓存文件是否存在——存在且校验健康则直接读取复用，不存在（或被显式 `force_refresh=True`）才触发 LLM/Docker/沙箱生成**。严禁静默复用损坏或降级状态缓存。
+
+1. **统一“先查存在再生成”协议（Read-Before-Generate Protocol）**：
+   - **Step 1（路径计算）**：基于 `settings.spec_cache_dir`（Patch-Blind 共享资产）或 `settings.result_dir`（单补丁终审断点）与标准化缓存键拼出确定性路径；
+   - **Step 2（命中检验）**：若 `not force_refresh and cache_path.is_file()`：通过 `read_json` 读取，校验 JSON 完整性与健康状态（若命中 `intent_parse_degraded=True`、`diagnostics.status == "degraded_failed"` 或 `status.startswith("degraded_")` 或 JSON 损坏，视为未命中并重生成）；命中后通过 `.from_dict(...)` 反序列化，并按需重新绑定本次调用的 `patch_id` / `anchors`；
+   - **Step 3（未命中生成并原子写盘）**：执行正常生成流程后，立即调用 `atomic_json(payload, cache_path)` 落盘，防止半写损坏。
+
+2. **公共缓存工具契约（归属 Step 1：`specpatchguard/core/cache_utils.py`）**：
+   - `sanitize_cache_segment(raw: str) -> str`：路径段安全清洗（替换 `/`、`\`、`::`、`..` 等非法字符）；
+   - `compute_anchor_methods_hash(anchors: list[DiffAnchor], target_methods: list[MethodSignatureInfo]) -> str`：对排序去重后的规范方法签名列表 `file_path::class.method(param_types)` 计算 12 位 SHA-256 短哈希（若无可解析方法签名则回退至排序后的 `(file_path, method_name, anchor_start_line, anchor_end_line)`）；
+   - `resolve_cache_path(base_dir: Path, category: str, filename: str) -> Path`：定位 `{base_dir}/{category}/{filename}`；
+   - `load_valid_cache(path: Path, *, force_refresh: bool = False, validator: Callable[[dict[str, Any]], bool] | None = None) -> dict[str, Any] | None`；
+   - `save_cache_atomic(path: Path, payload: dict[str, Any]) -> Path`（封装 `atomic_json`）。
+
+3. **分层文件存储路径、归属 Step 与复用范围矩阵**：
+
+| 缓存层级 | 归属 Step 与模块 | 存储路径与命名模板 | 存储内容（可复用资产） | 复用条件与健壮性规则 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Layer 0a**<br>D4J Fallback 元数据 | **Step 2**<br>`data/d4j_fallback.py` | `{spec_cache_dir}/d4j_meta/{safe_bug}__fallback_meta.json` | `BugReport`、`failing_tests`（`list[FailingTestRecord]`）、`d4j_info` 原文 | 按 `bug_id` 跨所有补丁/Tier 共享；文件存在即直读，无需重跑容器内 `defects4j info/export` |
+| **Layer 0b**<br>D4J Checkout 布局 | **Step 3**<br>`sandbox/d4j_runner.py` | `{spec_cache_dir}/d4j_meta/{safe_bug}__{version}__layout.json` | `D4jProjectLayout`（8 项 `defects4j export` 只读属性） | 当 `.defects4j.config` 存在（`__SPG_CHECKOUT_REUSED__`）、`not force_fresh`、`not force_refresh` 且缓存 `bug_id`/`version`/`work_dir` 一致时跳过 8 次 export |
+| **Layer 1**<br>Agent 1 完整意图与语义上下文 | **Step 5**<br>`agents/intent_agent.py` | `{spec_cache_dir}/intent/{safe_bug}__{anchor_hash}__intent_pack.json` | 完整 `IntentContextPack`（方法整体意图、`parameter_field_semantics` 含 `param\|field\|local_var\|return`、`callee_contracts`、`structured_defect_intent`、`boundary_context`、`entry_harness_skeleton`、`tier_decision`） | **不含 `patch_id`、不含 `tier`**；同缺陷同方法全部候选补丁与 Tier-A/B/C 消融 100% 共用；仅复用 `intent_parse_degraded=False` 缓存，读回时重绑定当前 `patch_id` 与 `anchors` |
+| **Layer 2**<br>Cross-Rep 跨表达产物 | **Step 5** `tier_a_cross_rep.py`<br>**Step 8** `tier_b_decision_table.py` / `tier_c_nonexec_python.py` | `{spec_cache_dir}/cross_rep/{safe_bug}__{anchor_hash}__{tier}__cross_rep.json` | `CrossRepResult`（`python_model_code` / `python_intent_code`、`candidate_inputs`、`soft_spec_candidates`、`diagnostics`） | 按 `(bug_id, anchor_hash, tier)` 跨补丁复用；仅复用 `diagnostics.status == "ok"` 缓存，隔离 Tier-A/B/C |
+| **Layer 3**<br>Agent 2 精化规约与 WitnessBank | **Step 5**<br>`agents/pbt_agent.py` | `{spec_cache_dir}/pbt/{safe_bug}__{anchor_hash}__{tier}__step5_spec.json`<br>（替代原绑死 `patch_id` 的 `{bug}__{patch}__step5_spec.json`） | `SpecRefinementResult`（`pre_post_spec`、`witness_bank`、`junit_source`、`anchor_probes`、`cross_rep_result`、`soft_spec_candidates`） | 按 `(bug_id, anchor_hash, tier)` 跨补丁复用；仅复用 `status in {"ok", "partial"}` 的健康缓存（拒绝 `degraded_*`）；命中后重绑定当前 `patch_id` |
+| **Layer 4**<br>Step 6 冻结规约包 | **Step 6**<br>`agents/merger_canonicalizer.py` | `{spec_cache_dir}/frozen/{safe_bug}__{anchor_hash}__{tier}__frozen_spec.json`<br>`{spec_cache_dir}/frozen/{safe_bug}__{anchor_hash}__{tier}__FrozenValidationTest.java` | `FrozenSpecBundle`（含 `CalibrationReport`、`verified_passing_witnesses`、`unverified_or_mismatched_passing`、`tier_b_deferred`/`tier_c_non_exec` 标记）与干净 Java 测试源文件 | 按 `(bug_id, anchor_hash, tier)` 跨补丁复用；Step 6 的 `<SimpleBlock>` 化简与 `Critic` 为补丁级，**不写入共享层** |
+| **Layer 5**<br>Step 7 单补丁终审断点 | **Step 7**<br>`pipeline/orchestrator.py` | `{result_dir}/verdicts/{safe_bug}__{safe_patch}__{tier}__verdict.json` | 单补丁 `JudgeVerdict`（含 Gate 1–4、`<SimpleBlock>` 与 `DisagreementCase`） | **不可跨补丁复用**；仅在 `output.resume=true` 时断点续跑跳过已判补丁 |
+
+4. **既有 Step 1/2/3/5 会话的增量重构分工与依赖顺序**：
+   - **前置基础（Step 1 & Step 2 并行先改）**：
+     - **Step 1（会话 `60bca072-b12d-4297-a719-f5cada948965`）**：交付 `specpatchguard/core/cache_utils.py` 并在 `config_loader.py` 向后兼容允许 `"tier_c"`、可选 `output.force_refresh` 与 `pipeline` 新键；
+     - **Step 2（会话 `ebd1939d-81cd-47fa-a51a-83c6f8c2ce3a`）**：升级 `data/schemas.py`（`TierType` 兼容 `"tier_c"`、`IntentContextPack` 三张表含 `local_var`、`CalibrationReport` / `DisagreementCase`），并在 `data/d4j_fallback.py` 接入 `d4j_meta/` 落盘复用；
+   - **下游接入（依赖 Step 1/2 完成后或兼容引入）**：
+     - **Step 3（会话 `ff664b45-b479-4080-a061-d02daf4d0ad6`）**：在 `sandbox/d4j_runner.py` 接入 `{spec_cache_dir}/d4j_meta/{safe_bug}__{version}__layout.json` 缓存复用；
+     - **Step 5（会话 `150a331d-d96e-4e94-8de2-4dbfa817b424`）**：升级 `intent_prompts.py` + `intent_agent.py`（完整方法意图与 `local_var` 语义表 + `intent/` 存在即复用）、`pbt_prompts.py` + `tier_a_cross_rep.py`（`cross_rep/` 存在即复用）及 `pbt_agent.py`（将缓存路径升级为 `pbt/` 且先判存在即复用）。
 
 ---
 
@@ -392,13 +431,13 @@ flowchart TD
 
 | 步骤 | 交付模块与核心职责（分层包路径） | 复用重点 | 预留接口 / 扩展点 |
 | :--- | :--- | :--- | :--- |
-| **Step 1** | **配置层 + 通用 LLM 配置 + 部署清单 + 自检**<br>`config/{config.json,llm_config.json}`、`.env.example`、`pytest.ini`、`SERVER_DEPLOY_CHECKLIST.md`、`specpatchguard/__main__.py`、`specpatchguard/core/{config_loader.py,llm_config.py,doctor.py}`、`tests/core/` | 复用 [furina_compat.py](file:///e:/workspace/Patch_Va/furina-main/furina-main/furina_compat.py) 配置校验与 `atomic_json` | 预留 `pipeline.target_tier` 与 `enable_cross_rep_tier_b` 开关；支持多模型 `max_tokens` 与思考/reasoning 方言 |
-| **Step 2** | **预处理数据加载 + Patch-Blind 剥离 + Tier 路由器**<br>`specpatchguard/data/{schemas.py,pkl_loader.py,patch_blind.py,tier_classifier.py}`、`tests/data/` | 复用 [PatchHelper.py](file:///e:/workspace/Patch_Va/furina-main/furina-main/util/PatchHelper.py) 与 `PlainUnpickler` 读取 `furina_context_data/*.pkl` | `schemas.py` 预留全部 Tier-B 字段；`TierClassifier` 准确区分 Tier-A / Tier-B |
-| **Step 3** | **Docker + D4J 统一后端**<br>`specpatchguard/sandbox/{docker_backend.py,d4j_runner.py,junit_injector.py}`、`tests/sandbox/` | 复用 [explanation-audit-agent/backend.py](file:///e:/workspace/Patch_Va/AutoCodeSherpa/explanation-audit-agent/backend.py) + [d4j.py](file:///e:/workspace/Patch_Va/Multi-Hunk-APR/Multi-Hunk-APR/d4j.py) | 同一容器工作区路径暴露给 Step 4 的 `jdtls`；预留行级探针插桩接口 |
+| **Step 1** | **配置层 + 通用 LLM 配置 + 部署清单 + 公共缓存基建 + 自检**<br>`config/{config.json,llm_config.json}`、`.env.example`、`pytest.ini`、`SERVER_DEPLOY_CHECKLIST.md`、`specpatchguard/__main__.py`、`specpatchguard/core/{config_loader.py,llm_config.py,cache_utils.py,doctor.py}`、`tests/core/` | 复用 [furina_compat.py](file:///e:/workspace/Patch_Va/furina-main/furina-main/furina_compat.py) 配置校验与 `atomic_json` | 预留 `pipeline.target_tier`（含 `tier_c`）、`output.force_refresh` 与 `enable_cross_rep_tier_b` 开关；`cache_utils.py` 提供 `compute_anchor_methods_hash` 与统一“存在即复用”原子读写 |
+| **Step 2** | **预处理数据加载 + Patch-Blind 剥离 + Tier 路由器 + Fallback 缓存**<br>`specpatchguard/data/{schemas.py,pkl_loader.py,d4j_fallback.py,patch_blind.py,tier_classifier.py}`、`tests/data/` | 复用 [PatchHelper.py](file:///e:/workspace/Patch_Va/furina-main/furina-main/util/PatchHelper.py) 与 `PlainUnpickler` 读取 `furina_context_data/*.pkl` | `schemas.py` 向后兼容扩展 `TierType`（`tier_c`）、`IntentContextPack` 三张表（含 `local_var`）、`CalibrationReport`/`DisagreementCase`；`d4j_fallback.py` 按 `d4j_meta/{bug}__fallback_meta.json` 存在即复用 |
+| **Step 3** | **Docker + D4J 统一后端 + 布局缓存**<br>`specpatchguard/sandbox/{docker_backend.py,d4j_runner.py,junit_injector.py}`、`tests/sandbox/` | 复用 [explanation-audit-agent/backend.py](file:///e:/workspace/Patch_Va/AutoCodeSherpa/explanation-audit-agent/backend.py) + [d4j.py](file:///e:/workspace/Patch_Va/Multi-Hunk-APR/Multi-Hunk-APR/d4j.py) | 同一容器工作区路径暴露给 Step 4 的 `jdtls`；预留行级探针插桩接口；`d4j_runner.py` 复用 checkout 时优先直读 `d4j_meta/{bug}__{version}__layout.json` 跳过 8 次 export |
 | **Step 4** | **Docker 内按需工具层（10 个单一职责工具：LSP + 可配 Context Grep + 分支/类属性/符号追踪）**<br>`specpatchguard/analysis/{protocols.py,lsp_client.py,repo_tools.py,ast_context.py,tool_registry.py}`、`tests/analysis/` | 复用 [explanation-audit-agent/tool.py](file:///e:/workspace/Patch_Va/AutoCodeSherpa/explanation-audit-agent/tool.py) & [tools.py](file:///e:/workspace/Patch_Va/Multi-Hunk-APR/Multi-Hunk-APR/tools.py) | 统一 Tool Schema（含 `context_before/after/lines` 与 `readonly_prepatch` 隔离）；`jdtls` 与 `tools` 配置全走 `config/config.json` + `# [SERVER_CONFIG_REQUIRED]` |
-| **Step 5** | **Agent 1 + Agent 2 + Tier-A Cross-Rep**<br>`specpatchguard/strategies/{protocols.py,tier_a_cross_rep.py,tier_a_harness.py}`、`specpatchguard/agents/{llm_client.py,intent_agent.py,pbt_agent.py}`、`specpatchguard/prompts/{intent_prompts.py,pbt_prompts.py}`、`tests/{strategies,agents}/` | 复用 FURINA `Profiler`、Multi²Fixer `BugAnalyzer`、AutoCodeSherpa `agent_reproducer.py` | 定义 `CrossRepStrategy` 与 `TestHarnessStrategy` Protocol，实装 Tier-A，占位注册 Tier-B |
-| **Step 6** | **Agent 3（双侧校准门禁 + 规约合并冻结 + `<SimpleBlock>` 化简 + Critic）+ Agent 1 结构化语义表增量升级**<br>`specpatchguard/agents/merger_canonicalizer.py`、`specpatchguard/prompts/canonicalizer_prompts.py`、向后兼容增量升级 `specpatchguard/data/schemas.py`（`CalibrationReport` / `DisagreementCase` 及 `IntentContextPack` 三张结构化语义表、`TierType` 兼容 `"tier_c"`）、`specpatchguard/{prompts/intent_prompts.py,agents/intent_agent.py,prompts/pbt_prompts.py}`、`tests/agents/` | 复用 FURINA `Interpreter` / `Critic` Prompt 与 `ExtractLabelContainer`；直接消费 Step 5 `ref_hint` 与 `observed_buggy_outcome` 计算双侧校准 | 支持把 `soft_spec_candidates` 接入统一优先级冲突消解器；未通过双侧校准的 Python 模型显式降级为 `calibrated=False`；遇到 `status="tier_b_placeholder"` 优雅记为 `tier_b_deferred`、遇到 Tier-C 强制设 `CalibrationReport(calibrated=False, reason="tier_c_non_executable")` 与 `tier_c_non_exec` |
-| **Step 7** | **Agent 4（Patch Judge 四级漏斗：PBT 实测 + 补丁靶向分歧挖掘 + 单点仲裁）+ 流水线评测**<br>`specpatchguard/agents/{disagreement_miner.py,judge_agent.py}`、`specpatchguard/prompts/adapted_rules.py`、`specpatchguard/pipeline/{orchestrator.py,eval_metrics.py}`、`tests/pipeline/` | 复用 FURINA `Judge` 6 Tips 与 [rule.md](file:///e:/workspace/benchmark/rule.md) | 消费 `CalibrationReport`、`DisagreementCase`、`soft_spec_findings`；遇到 `tier_b_deferred` 或 `tier_c_non_exec` 自动跳过依赖执行模型的 Gate 1/2 环节直通 Gate 3/4；`eval_metrics.py` 同时输出 Gate-1-only 与完整流水线指标 |
+| **Step 5** | **Agent 1 + Agent 2 + Tier-A Cross-Rep + 三层文件缓存复用**<br>`specpatchguard/strategies/{protocols.py,tier_a_cross_rep.py,tier_a_harness.py}`、`specpatchguard/agents/{llm_client.py,intent_agent.py,pbt_agent.py}`、`specpatchguard/prompts/{intent_prompts.py,pbt_prompts.py}`、`tests/{strategies,agents}/` | 复用 FURINA `Profiler`、Multi²Fixer `BugAnalyzer`、AutoCodeSherpa `agent_reproducer.py` | 落实 Agent 1 完整意图 + `local_var` 等 3 张语义表并接入 `intent/` 跨 Tier 复用；`tier_a_cross_rep.py` 接入 `cross_rep/` 复用；`pbt_agent.py` 升级为 `pbt/` 存在即复用；占位注册 Tier-B |
+| **Step 6** | **Agent 3（双侧校准门禁 + 规约合并冻结 + `<SimpleBlock>` 化简 + Critic）**<br>`specpatchguard/agents/merger_canonicalizer.py`、`specpatchguard/prompts/canonicalizer_prompts.py`、`tests/agents/` | 复用 FURINA `Interpreter` / `Critic` Prompt 与 `ExtractLabelContainer`；直接消费 Step 5 `ref_hint` 与 `observed_buggy_outcome` 计算双侧校准 | 支持把 `soft_spec_candidates` 接入统一优先级冲突消解器；`frozen/` 按 `(bug_id, anchor_hash, tier)` 存在即复用；未通过双侧校准显式降级为 `calibrated=False`；兼容 `tier_b_deferred` 与 `tier_c_non_exec` |
+| **Step 7** | **Agent 4（Patch Judge 四级漏斗：PBT 实测 + 补丁靶向分歧挖掘 + 单点仲裁）+ 流水线评测**<br>`specpatchguard/agents/{disagreement_miner.py,judge_agent.py}`、`specpatchguard/prompts/adapted_rules.py`、`specpatchguard/pipeline/{orchestrator.py,eval_metrics.py}`、`tests/pipeline/` | 复用 FURINA `Judge` 6 Tips 与 [rule.md](file:///e:/workspace/benchmark/rule.md) | 消费 `CalibrationReport`、`DisagreementCase`、`soft_spec_findings`；遇到 `tier_b_deferred` 或 `tier_c_non_exec` 自动跳过依赖执行模型的 Gate 1/2 环节直通 Gate 3/4；`verdicts/` 支持 `resume=true` 断点跳过；`eval_metrics.py` 输出 Gate-1-only 与完整指标 |
 | **Step 8（Phase-2 Tier-B & Tier-C）** | **Tier-B 谓词抽象决策表与公共入口探针实证 + Tier-C 免执行意图转 Python 提规约**<br>`specpatchguard/strategies/{tier_b_decision_table.py,tier_b_harness.py,tier_c_nonexec_python.py}`、`specpatchguard/prompts/{tier_b_prompts.py,tier_c_prompts.py}`、`tests/strategies/` | 复用 Step 3 `ReadOnlyAnchorProbeInjector`、`trigger_test` 骨架、Step 4 LSP/AST 工具与 Agent 1 三张结构化语义表 | Tier-B：双智能体独立提名+1分制累计排名筛选（硬上限 `<= 6` 谓词）→ $2^{|P|}$ 决策表差集 `SoftSpecCandidate` + 公共入口探针自动回退；Tier-C：意图→免运行 Python→Spec Reader 提规约，在 `StrategyRegistry` 注册且不改变默认 `Tier-A/Tier-B` 自动路由 |
 
 ---
@@ -455,8 +494,10 @@ flowchart TD
 > [!NOTE]
 > 为支持“**一个功能一个独立会话**”且防止新会话上下文不足，下文记录关键会话 ID、已完成交付物、GSD Review 已修复的缺陷以及下一会话可直接接续的入口。若后续新窗口需要追溯详细思考过程，可直接引用以下对话：
 > - **规划与三论文对比会话 ID**：`9ee44157-8d58-4277-808a-f28b5417f552`（标题：`Paper PBT Generation And Feasibility Analysis`）
-> - **Step 1 + Step 4 实现与 GSD Review 修复会话 ID**：`60bca072-b12d-4297-a719-f5cada948965`
-> - **Step 2 实现、按需数据集接口重构与自审修复会话 ID**：`ebd1939d-81cd-47fa-a51a-83c6f8c2ce3a`
+> - **Step 1 + Step 4 实现与 GSD Review 修复会话 ID**：`60bca072-b12d-4297-a719-f5cada948965`（标题：`Step1 & Step4`）
+> - **Step 2 实现、按需数据集接口重构与自审修复会话 ID**：`ebd1939d-81cd-47fa-a51a-83c6f8c2ce3a`（标题：`Step2`）
+> - **Step 3 实现与 GSD Review 修复会话 ID**：`ff664b45-b479-4080-a061-d02daf4d0ad6`（标题：`Executing Step 3 Plan`）
+> - **Step 5 实现与 GSD Review 修复会话 ID**：`150a331d-d96e-4e94-8de2-4dbfa817b424`（标题：`Step5`）
 > - **项目根目录本地同步副本**：`E:\workspace\myown\SpecPatchGuard\PLAN.md`
 
 ### 9.1 当前已实现并验收通过的模块（Step 1 + Step 2 + Step 3 + Step 4 + Step 5）
@@ -525,17 +566,21 @@ flowchart TD
   - `CRIT-04`：`PbtSpecAgent._extract_initial_spec` 接通 `ToolDispatcher` 执行有界工具循环。
   - `WARN-01`..`WARN-05` & `INFO-01`..`INFO-02`：默认 `OpenAI` SDK 设置 `max_retries=0` 消除重试乘法放大；`_run_with_syntax_fix` 拒绝重复编译未修改坏源码；精化更新补全 `invariants` 判空与显式 `partial`/`degraded_refine_parse` 状态；`_assert_dispatcher_patch_blind` 全量校验 `dispatcher` 所有工具对象；Java 注释/异常字面量清洗；`_expected_failure_signatures` 全行正则适配 `d4j_fallback` 多行异常栈；并更新 `DockerD4jFallbackProvider.fetch_bug_report` 默认 `include_d4j_summary=False` 防止泄露 `defects4j info` 修复摘要。
 
-### 9.3 下一步独立会话推进建议（Step 6–8）
-- **下一会话推荐从 Step 6 开始**（`specpatchguard/agents/merger_canonicalizer.py`、`specpatchguard/prompts/canonicalizer_prompts.py`、向后兼容扩展 `specpatchguard/data/schemas.py`、`specpatchguard/{prompts/intent_prompts.py,agents/intent_agent.py,prompts/pbt_prompts.py}`、`tests/agents/`）：
-  1. 向后兼容新增 `CalibrationReport`、`DisagreementCase` 及 `FrozenSpecBundle.calibration_report` / `JudgeVerdict.disagreement_cases`，同时为 `IntentContextPack` 增量添加三张显式结构化表（`parameter_field_semantics`、`callee_contracts`、`structured_defect_intent`，默认空集合）、将 `TierType` 扩展支持 `"tier_c"`（不改变默认 `Tier-A/Tier-B` 路由），并同步升级 `intent_prompts.py` / `intent_agent.py`（纯英文输出约束）与 `pbt_prompts.py` 消费（确保 Step 1–5 全部既有单测零破坏）；
-  2. 实现 **双侧校准门禁（Section 4.3 Stage A）** 与 **Section 4.4 防误杀分流/冻结测试重建**：消费 Step 5 `ref_hint`、`observed_buggy_outcome` 与 F2P 期望计算 `CalibrationReport`（若遇到 Step 5 返回 `status="tier_b_placeholder"` 则优雅标为 `tier_b_deferred`；遇到 Tier-C 则强制设 `CalibrationReport(calibrated=False, reason="tier_c_non_executable")` 与 `tier_c_non_exec`）；将通过样本严格分流为 `verified_passing_witnesses` 与 `unverified_or_mismatched_passing`；使用 `(bug_id, canonical_anchor_methods_hash)` 缓存冻结 `FrozenSpecBundle` 与干净 `FrozenValidationTest.java`；
-  3. 实现 Agent 3：多源规约合并冻结（Priority 1 > 2 > 3 冲突消解）、FURINA `<SimpleBlock>` 补丁化简与 `Critic` 局部上下文一致性分析（**Section 4.5：全过程 Prompt 与输出严格纯英文**）。
+### 9.3 既有会话缓存增量补强与下一步独立会话推进建议（Step 1–3/5 补强 + Step 6–8）
+- **既有会话增量补强任务（按 Section 4.6.1 与 Section 4.7 分配回原负责会话）**：
+  - **Step 1（`60bca072-b12d-4297-a719-f5cada948965`）**：交付公共缓存工具 `specpatchguard/core/cache_utils.py`，并在 `config_loader.py` 向后兼容支持 `"tier_c"`、可选 `output.force_refresh` 与 `pipeline` 新键；
+  - **Step 2（`ebd1939d-81cd-47fa-a51a-83c6f8c2ce3a`）**：向后兼容升级 `data/schemas.py`（`TierType` 兼容 `"tier_c"`、`IntentContextPack` 三张表含 `local_var`、`CalibrationReport`/`DisagreementCase`），并在 `data/d4j_fallback.py` 接入 `d4j_meta/{bug}__fallback_meta.json` 存在即复用；
+  - **Step 3（`ff664b45-b479-4080-a061-d02daf4d0ad6`）**：在 `sandbox/d4j_runner.py` 接入 `d4j_meta/{bug}__{version}__layout.json` 缓存复用，复用 checkout 时跳过 8 次 `defects4j export`；
+  - **Step 5（`150a331d-d96e-4e94-8de2-4dbfa817b424`）**：升级 `intent_prompts.py` + `intent_agent.py`（完整意图与 `local_var` 语义表 + `intent/` 跨 Tier 存在即复用）、`pbt_prompts.py` + `tier_a_cross_rep.py`（`cross_rep/` 存在即复用）及 `pbt_agent.py`（缓存路径升级至 `pbt/{bug}__{anchor_hash}__{tier}__step5_spec.json` 并接入存在即复用）。
+- **下一新会话推荐从 Step 6 开始**（`specpatchguard/agents/merger_canonicalizer.py`、`specpatchguard/prompts/canonicalizer_prompts.py`、`tests/agents/`）：
+  1. 实现 **双侧校准门禁（Section 4.3 Stage A）** 与 **Section 4.4 防误杀分流/冻结测试重建**：消费 Step 5 `ref_hint`、`observed_buggy_outcome` 与 F2P 期望计算 `CalibrationReport`（若遇到 Step 5 返回 `status="tier_b_placeholder"` 则优雅标为 `tier_b_deferred`；遇到 Tier-C 则强制设 `CalibrationReport(calibrated=False, reason="tier_c_non_executable")` 与 `tier_c_non_exec`）；将通过样本严格分流为 `verified_passing_witnesses` 与 `unverified_or_mismatched_passing`；使用 `(bug_id, canonical_anchor_methods_hash, effective_tier)` 在 `{spec_cache_dir}/frozen/` 存在即复用冻结 `FrozenSpecBundle` 与干净 `FrozenValidationTest.java`；
+  2. 实现 Agent 3：多源规约合并冻结（Priority 1 > 2 > 3 冲突消解）、FURINA `<SimpleBlock>` 补丁化简与 `Critic` 局部上下文一致性分析（补丁级，不写入共享 `frozen/` 层；**Section 4.5：全过程 Prompt 与输出严格纯英文**）。
 - **随后推进 Step 7**：
   1. 实现 `specpatchguard/agents/disagreement_miner.py`（Gate 2：分析待审 `<SimpleBlock>` 新分支/常量/早退，生成补丁靶向探针，并通过安全子进程调用 `ref_impl(*args)`（Section 4.4 第 4 条）采集 `DisagreementCase(x*, P(x*), P'(x*), M_py(x*))`；`calibrated=False` / `tier_b_deferred` / `tier_c_non_exec` 严禁启用 Python 分歧挖掘）；
   2. 实现 `specpatchguard/agents/judge_agent.py` + `specpatchguard/prompts/adapted_rules.py`（**将中文 `benchmark/rule.md` 全面转写为结构化英文规则，严禁透传中文**；按 Section 4.4 第 5 条优先级执行 Gate 1 短路 → Gate 2 分歧挖掘 → Gate 3 单点分歧仲裁 + LSP 边界封闭性 + `rule.md` 红线 → Gate 4 结合 FURINA 6 Tips 终审；遇到 `tier_b_deferred` 或 `tier_c_non_exec` 自动跳过依赖执行模型的 Gate 1/2 环节直通 Gate 3/4）；
-  3. 实现 `specpatchguard/pipeline/{orchestrator.py,eval_metrics.py}`（同时统计 Gate-1-only、Full Pipeline、`UNCERTAIN -> 0` 保守二分类与 `decided_only` 指标，以及 Section 8 消融维度）。
+  3. 实现 `specpatchguard/pipeline/{orchestrator.py,eval_metrics.py}`（接入 `{result_dir}/verdicts/{bug}__{patch}__{tier}__verdict.json` 断点续跑跳过已判补丁，同时统计 Gate-1-only、Full Pipeline、`UNCERTAIN -> 0` 保守二分类与 `decided_only` 指标，以及 Section 8 消融维度）。
 - **随后推进 Step 8（Phase-2 Tier-B & Tier-C）**：
-  1. 实现 `specpatchguard/strategies/tier_b_decision_table.py` + `specpatchguard/prompts/tier_b_prompts.py`：严格落实 Section 4.6.2，利用 Agent 1 三张结构化语义表，由**两个独立 LLM 智能体**分别提名候选谓词，等价归一化后按“每名智能体选中 +1 分”累计总分排序并**硬性截断 `<= 6` 个谓词**（`MAX_TIER_B_PREDICATES = 6`），在 $2^{|P|}$ 谓词空间上抽取分歧条件作为 `SoftSpecCandidate`；
+  1. 实现 `specpatchguard/strategies/tier_b_decision_table.py` + `specpatchguard/prompts/tier_b_prompts.py`：严格落实 Section 4.6.2，利用 Agent 1 三张结构化语义表，由**两个独立 LLM 智能体**分别提名候选谓词，等价归一化后按“每名智能体选中 +1 分”累计总分排序并**硬性截断 `<= 6` 个谓词**（`MAX_TIER_B_PREDICATES = 6`），在 $2^{|P|}$ 谓词空间上抽取分歧条件作为 `SoftSpecCandidate`（接入 `cross_rep/` 缓存）；
   2. 实现 `specpatchguard/strategies/tier_b_harness.py`（`PublicEntryAnchorProbeHarness`）：复用 `entry_harness_skeleton` 公共入口并结合 `ReadOnlyAnchorProbeInjector` 做 JVM 实证，若公共入口变异编译失败或未击中锚点则自动回退到 Layer 1 结论；
-  3. 实现 `specpatchguard/strategies/tier_c_nonexec_python.py`（`TierCNonExecPythonSpecStrategy`）+ `specpatchguard/prompts/tier_c_prompts.py` + `tests/strategies/test_tier_c_nonexec_python.py`：严格落实 Section 4.6.3，消费 Agent 1 三张结构化语义表与 Patch-Blind 原缺陷类方法生成免运行 `python_intent_code`，**禁止在任何子进程执行 Python**，直接由 Spec Reader LLM 通读后输出 `PrePostSpec` 与 `SoftSpecCandidate(source="tier_c_nonexec_python")`，并在 `StrategyRegistry` 注册且不改变默认 `Tier-A/Tier-B` 路由。
+  3. 实现 `specpatchguard/strategies/tier_c_nonexec_python.py`（`TierCNonExecPythonSpecStrategy`）+ `specpatchguard/prompts/tier_c_prompts.py` + `tests/strategies/test_tier_c_nonexec_python.py`：严格落实 Section 4.6.3，消费 Agent 1 三张结构化语义表与 Patch-Blind 原缺陷类方法生成免运行 `python_intent_code`，**禁止在任何子进程执行 Python**，直接由 Spec Reader LLM 通读后输出 `PrePostSpec` 与 `SoftSpecCandidate(source="tier_c_nonexec_python")`（接入 `cross_rep/` 缓存），并在 `StrategyRegistry` 注册且不改变默认 `Tier-A/Tier-B` 路由。
 

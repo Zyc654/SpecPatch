@@ -19,7 +19,7 @@
   "docker": {
     "image_name": "d4j-lsp-runtime:latest",
     "container_work_root": "/workspace/d4j_work",
-    "host_mount_root": "/data/patch_va/d4j_work",
+    "host_mount_root": "../d4j_work",
     "timeout_seconds": 900,
     "nano_cpus": 8000000000
   },
